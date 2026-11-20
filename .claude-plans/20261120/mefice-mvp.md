@@ -2,6 +2,43 @@
 
 ## 플랜 실행 이력
 
+### 2단계 완료: 2026-11-20
+
+**결과**: 성공
+
+**런타임 프로토콜 검증 결과 (Claude Code 2.1.304)**:
+- 승인 요청을 받으려면 `--permission-prompt-tool stdio`(도움말에 없는 옵션) + stdin으로 `initialize` 제어 요청 필요. 둘 중 하나라도 없으면 승인 없이 자동 거부됨
+- `interrupt` 제어 요청 → 현재 턴이 `result`로 종료. `result` 후에도 프로세스는 다음 메시지를 기다리고, stdin을 닫으면 exit 0
+- `result.usage`는 턴 단위, `total_cost_usd`는 세션 누적이며 API 정가 기준(`costBasis: list`)
+- `--strict-mcp-config --tools <목록>` 지정 시 첫 호출 캐시 생성 토큰 ~35k → ~5–10k
+
+**실제 변경 파일**:
+- `db/migrations.rs` — v2: `agents`, `tasks`, `runs`, `run_events`, `approvals`
+- `agent.rs` — 에이전트 CRUD, 권한 모드(default/acceptEdits/plan, bypass 미제공), 허용 도구 목록
+- `runtime/mod.rs` — `RunConfig`(설정 스냅샷), `Usage`, 공통 `RunEvent`
+- `runtime/claude_code.rs` — 명령 구성, stream-json 파서, 입력 인코더
+- `task.rs` — Task/Run/RunEvent/Approval 저장소, 재시작 시 미완료 Run → `interrupted`
+- `executor.rs` — 큐(동시 실행 상한), 프로세스 구동, 승인·추가 지시·중단(5초 후 강제 종료)
+- `commands.rs`, `lib.rs` — 명령 14개 추가
+- `sysproc.rs` — 자식 프로세스용 로그인 셸 PATH
+- `src/screens/Tasks.tsx`, `Team.tsx`, `components/StatusBadge.tsx`, `api/index.ts`, `styles.css`
+
+**계획과의 차이**:
+- 승인 흐름(`waiting_for_approval`)을 2단계에서 구현 (권한 기본값을 "승인 필요"로 정했고, 프로젝트 폴더에서 직접 실행되므로 필수)
+- 단순 FIFO 큐와 동시 실행 상한도 2단계에서 구현 (의존성은 5단계 그대로)
+- 재시작 시 `interrupted` 처리를 3단계에서 앞당김
+- "작업 보드" 탭을 직접 실행 + 목록 + 상세 화면으로 우선 구현
+
+**검증**:
+- 단위 테스트 20개 통과, clippy 경고 0, `pnpm build` 성공
+- 실제 CLI 통합 테스트 2개 통과 (`cargo test live_ -- --ignored`): 승인 후 파일 쓰기 성공, 실행 중 중단 → cancelled
+- 기존 v1 DB → v2 마이그레이션을 실제 앱 실행으로 확인
+
+**잔존 작업**:
+- UI 수동 확인 (에이전트 추가 → 직접 실행 → 승인/거부 → 추가 지시 → 중단 → 이어서 실행)
+- `waiting_for_input`(런타임의 질문 도구) 미지원 — 질문은 텍스트로 받고 "이어서 실행"으로 답하는 방식
+- 사용량 집계(PM/작업자 구분, 출처 표시)는 3단계
+
 ### 1단계 완료: 2026-11-20
 
 **결과**: 성공

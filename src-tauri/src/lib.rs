@@ -1,10 +1,14 @@
+mod agent;
 mod commands;
 mod db;
 mod env_check;
 mod error;
+mod executor;
 mod project;
+mod runtime;
 mod settings;
 mod sysproc;
+mod task;
 
 use tauri::Manager;
 
@@ -16,7 +20,10 @@ pub fn run() {
             // macOS: ~/Library/Application Support/dev.mefice.app/mefice.db
             let data_dir = app.path().app_data_dir()?;
             let db = db::Db::open(&data_dir.join("mefice.db"))?;
+            // 이전 실행에서 끝나지 않은 Run은 실제 상태를 확인할 수 없으므로 interrupted로 표시 (스펙 9장)
+            task::interrupt_unfinished_runs(&*db.conn()?)?;
             app.manage(db);
+            app.manage(executor::Executor::new(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -26,6 +33,20 @@ pub fn run() {
             commands::update_project_instructions,
             commands::update_settings,
             commands::check_environment,
+            commands::list_agents,
+            commands::create_agent,
+            commands::update_agent,
+            commands::archive_agent,
+            commands::start_direct_task,
+            commands::rerun_task,
+            commands::continue_task,
+            commands::list_tasks,
+            commands::get_task_detail,
+            commands::get_run_events,
+            commands::get_pending_approvals,
+            commands::send_run_message,
+            commands::cancel_run,
+            commands::respond_approval,
         ])
         .run(tauri::generate_context!())
         .expect("Mefice 실행 중 오류가 발생했습니다");

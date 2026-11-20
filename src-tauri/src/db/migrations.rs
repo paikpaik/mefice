@@ -22,6 +22,79 @@ const MIGRATIONS: &[&str] = &[
         last_opened_at INTEGER NOT NULL
     );
     "#,
+    // v2: 에이전트, 작업, 실행, 실행 이벤트, 승인 (2단계: 런타임 어댑터와 직접 실행)
+    r#"
+    CREATE TABLE agents (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        name            TEXT    NOT NULL,
+        role            TEXT    NOT NULL,
+        instructions    TEXT    NOT NULL DEFAULT '',
+        model           TEXT,
+        effort          TEXT,
+        permission_mode TEXT    NOT NULL DEFAULT 'default',
+        tools           TEXT    NOT NULL DEFAULT '[]',
+        color           TEXT    NOT NULL DEFAULT '#3a6df0',
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        archived_at     INTEGER
+    );
+
+    CREATE TABLE tasks (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL REFERENCES projects(id),
+        agent_id   INTEGER NOT NULL REFERENCES agents(id),
+        parent_id  INTEGER REFERENCES tasks(id),
+        mode       TEXT    NOT NULL DEFAULT 'direct',
+        title      TEXT    NOT NULL,
+        prompt     TEXT    NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX idx_tasks_project ON tasks(project_id, id);
+
+    CREATE TABLE runs (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id           INTEGER NOT NULL REFERENCES tasks(id),
+        agent_id          INTEGER NOT NULL REFERENCES agents(id),
+        attempt           INTEGER NOT NULL,
+        status            TEXT    NOT NULL,
+        prompt            TEXT    NOT NULL,
+        resume_session_id TEXT,
+        session_id        TEXT,
+        config_snapshot   TEXT    NOT NULL,
+        cwd               TEXT    NOT NULL,
+        pid               INTEGER,
+        exit_code         INTEGER,
+        error             TEXT,
+        created_at        INTEGER NOT NULL,
+        started_at        INTEGER,
+        ended_at          INTEGER
+    );
+    CREATE INDEX idx_runs_task ON runs(task_id, id);
+    CREATE INDEX idx_runs_status ON runs(status);
+
+    CREATE TABLE run_events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id     INTEGER NOT NULL REFERENCES runs(id),
+        seq        INTEGER NOT NULL,
+        kind       TEXT    NOT NULL,
+        payload    TEXT    NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (run_id, seq)
+    );
+
+    CREATE TABLE approvals (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id      INTEGER NOT NULL REFERENCES runs(id),
+        request_id  TEXT    NOT NULL,
+        tool_name   TEXT    NOT NULL,
+        tool_input  TEXT    NOT NULL,
+        description TEXT,
+        status      TEXT    NOT NULL DEFAULT 'pending',
+        created_at  INTEGER NOT NULL,
+        decided_at  INTEGER
+    );
+    CREATE INDEX idx_approvals_run ON approvals(run_id, status);
+    "#,
 ];
 
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {

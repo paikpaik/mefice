@@ -62,6 +62,31 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
+/// 자식 프로세스에 넘겨줄 PATH. 로그인 셸의 PATH와 현재 PATH를 합친다 (한 번만 계산).
+/// GUI 앱에서 실행한 런타임이 훅·도구 실행 시 node 등을 찾지 못하는 문제를 막는다.
+pub fn child_path() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let login = Command::new(shell)
+            .args(["-lc", "printf %s \"$PATH\""])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let current = std::env::var("PATH").unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        login
+            .split(':')
+            .chain(current.split(':'))
+            .chain(COMMON_DIRS.iter().copied())
+            .filter(|d| !d.is_empty() && seen.insert(d.to_string()))
+            .collect::<Vec<_>>()
+            .join(":")
+    })
+}
+
 /// 명령을 실행하고 성공 시 stdout(trim)을 돌려준다. 실패하면 None.
 pub fn run_capture(bin: &Path, args: &[&str], cwd: Option<&Path>) -> Option<String> {
     let mut cmd = Command::new(bin);

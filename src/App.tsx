@@ -3,6 +3,8 @@ import { api, errorMessage, type AppSettings, type ProjectView } from "./api";
 import { Welcome } from "./screens/Welcome";
 import { Settings } from "./screens/Settings";
 import { Placeholder } from "./screens/Placeholder";
+import { Tasks } from "./screens/Tasks";
+import { Team } from "./screens/Team";
 import "./styles.css";
 
 type Tab = "office" | "pm" | "board" | "team" | "settings";
@@ -10,7 +12,7 @@ type Tab = "office" | "pm" | "board" | "team" | "settings";
 const TABS: { id: Tab; label: string }[] = [
   { id: "office", label: "사무실" },
   { id: "pm", label: "PM 채팅" },
-  { id: "board", label: "작업 보드" },
+  { id: "board", label: "작업" },
   { id: "team", label: "팀" },
   { id: "settings", label: "설정" },
 ];
@@ -61,12 +63,8 @@ export default function App() {
         {tab === "pm" && (
           <Placeholder title="PM 채팅" stage={4} description="작업 목표를 입력하면 PM이 직접 수행·단일 위임·병렬 분할을 결정" />
         )}
-        {tab === "board" && (
-          <Placeholder title="작업 보드" stage={3} description="대기·진행·입력 대기·완료·실패 작업 목록과 상세 패널" />
-        )}
-        {tab === "team" && (
-          <Placeholder title="고용·팀 관리" stage={6} description="역할 템플릿에서 에이전트를 고용하고 능력·권한·실행 설정 지정" />
-        )}
+        {tab === "board" && <Tasks onGoTeam={() => setTab("team")} />}
+        {tab === "team" && <Team />}
         {tab === "settings" && (
           <Settings
             project={project}
