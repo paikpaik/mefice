@@ -38,6 +38,40 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
 }
 
+/// 런타임 세션 전체의 누적 사용량 (내부 보조 호출 포함).
+/// 턴별 `Usage`는 내부 호출을 빠뜨리므로, 집계는 이 누적값의 차이로 계산한다.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub models: Vec<String>,
+}
+
+/// 구독 한도 사용률 창 (예: five_hour, seven_day). 계정 전체 값이며 Mefice 외 사용도 포함된다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitWindow {
+    pub name: String,
+    /// 0.0 ~ 1.0
+    pub utilization: f64,
+    /// 유닉스 초
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitSnapshot {
+    pub status: Option<String>,
+    pub windows: Vec<RateLimitWindow>,
+    /// 관측 시각 (epoch ms, 실행 관리자가 채움)
+    #[serde(default)]
+    pub observed_at: i64,
+}
+
 /// 저장·표시용 공통 실행 이벤트. `kind` 태그가 run_events.kind 컬럼이 된다.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -50,6 +84,9 @@ pub enum RunEvent {
     Started {
         session_id: String,
         model: Option<String>,
+        /// subscription | api_key | unknown (2단계에서 저장된 이벤트에는 없음)
+        #[serde(default)]
+        auth: Option<String>,
     },
     /// 사용자가 보낸 메시지 (최초 지시, 추가 지시)
     UserMessage {
@@ -92,9 +129,13 @@ pub enum RunEvent {
         is_error: bool,
         subtype: String,
         result: Option<String>,
+        /// 이 턴의 사용량 (런타임 보고, 내부 보조 호출 제외)
         usage: Usage,
         duration_ms: Option<u64>,
         num_turns: Option<u64>,
+        /// 세션 누적 사용량 (2단계에서 저장된 이벤트에는 없음)
+        #[serde(default)]
+        session_totals: Option<SessionTotals>,
     },
     /// 런타임 stderr (진단용, 일부만 저장)
     Stderr {
@@ -136,6 +177,8 @@ pub enum Parsed {
         input: Value,
         description: Option<String>,
     },
+    /// 구독 한도 사용률 갱신 (Run 이벤트로 저장하지 않고 앱 전역 상태로 관리)
+    RateLimit(RateLimitSnapshot),
 }
 
 /// 문자 수 기준으로 자른다 (UTF-8 경계 안전).

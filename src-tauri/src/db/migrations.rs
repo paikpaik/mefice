@@ -95,6 +95,37 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_approvals_run ON approvals(run_id, status);
     "#,
+    // v3: 사용량 (3단계: 이벤트·이력·사용량)
+    r#"
+    ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'worker';
+    ALTER TABLE runs ADD COLUMN auth_kind TEXT;
+
+    -- 턴마다 1행. source: reported(세션 누적 차이, 내부 호출 포함)
+    --                    partial(턴 사용량만, 내부 호출 제외)
+    --                    unavailable(런타임이 수치를 주지 않음)
+    CREATE TABLE usage_records (
+        id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id                    INTEGER NOT NULL REFERENCES runs(id),
+        session_id                TEXT,
+        role                      TEXT    NOT NULL,
+        source                    TEXT    NOT NULL,
+        input_tokens              INTEGER,
+        output_tokens             INTEGER,
+        cache_read_tokens         INTEGER,
+        cache_creation_tokens     INTEGER,
+        cost_usd                  REAL,
+        cum_input_tokens          INTEGER,
+        cum_output_tokens         INTEGER,
+        cum_cache_read_tokens     INTEGER,
+        cum_cache_creation_tokens INTEGER,
+        cum_cost_usd              REAL,
+        models                    TEXT,
+        created_at                INTEGER NOT NULL
+    );
+    CREATE INDEX idx_usage_run ON usage_records(run_id);
+    CREATE INDEX idx_usage_session ON usage_records(session_id, id);
+    CREATE INDEX idx_usage_created ON usage_records(created_at);
+    "#,
 ];
 
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {

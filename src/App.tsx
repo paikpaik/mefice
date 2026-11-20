@@ -5,15 +5,17 @@ import { Settings } from "./screens/Settings";
 import { Placeholder } from "./screens/Placeholder";
 import { Tasks } from "./screens/Tasks";
 import { Team } from "./screens/Team";
+import { UsageScreen } from "./screens/UsageScreen";
 import "./styles.css";
 
-type Tab = "office" | "pm" | "board" | "team" | "settings";
+type Tab = "office" | "pm" | "board" | "team" | "usage" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "office", label: "사무실" },
   { id: "pm", label: "PM 채팅" },
   { id: "board", label: "작업" },
   { id: "team", label: "팀" },
+  { id: "usage", label: "사용량" },
   { id: "settings", label: "설정" },
 ];
 
@@ -65,6 +67,7 @@ export default function App() {
         )}
         {tab === "board" && <Tasks onGoTeam={() => setTab("team")} />}
         {tab === "team" && <Team />}
+        {tab === "usage" && <UsageScreen />}
         {tab === "settings" && (
           <Settings
             project={project}

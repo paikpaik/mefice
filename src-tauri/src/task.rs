@@ -84,6 +84,10 @@ pub struct Run {
     pub task_id: i64,
     pub agent_id: i64,
     pub attempt: i64,
+    /// 사용량 구분: pm | worker | review
+    pub role: String,
+    /// subscription | api_key (런타임 시작 후 채워짐)
+    pub auth_kind: Option<String>,
     pub status: RunStatus,
     pub prompt: String,
     pub resume_session_id: Option<String>,
@@ -209,6 +213,8 @@ fn run_from_row(r: &Row) -> rusqlite::Result<Run> {
         task_id: r.get("task_id")?,
         agent_id: r.get("agent_id")?,
         attempt: r.get("attempt")?,
+        role: r.get("role")?,
+        auth_kind: r.get("auth_kind")?,
         status: RunStatus::from_db(&status),
         prompt: r.get("prompt")?,
         resume_session_id: r.get("resume_session_id")?,
@@ -313,6 +319,14 @@ pub fn mark_run_started(conn: &Connection, id: i64, session_id: &str) -> AppResu
 
 pub fn set_run_pid(conn: &Connection, id: i64, pid: Option<u32>) -> AppResult<()> {
     conn.execute("UPDATE runs SET pid = ?1 WHERE id = ?2", params![pid, id])?;
+    Ok(())
+}
+
+pub fn set_run_auth(conn: &Connection, id: i64, auth_kind: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE runs SET auth_kind = ?1 WHERE id = ?2",
+        params![auth_kind, id],
+    )?;
     Ok(())
 }
 

@@ -110,6 +110,10 @@ export interface Run {
   taskId: number;
   agentId: number;
   attempt: number;
+  /** 사용량 구분 */
+  role: UsageRole;
+  /** subscription | api_key — 런타임 시작 후 채워짐 */
+  authKind: string | null;
   status: RunStatus;
   prompt: string;
   resumeSessionId: string | null;
@@ -150,8 +154,66 @@ export interface Usage {
   costUsd: number | null;
 }
 
+export interface SessionTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number | null;
+  models: string[];
+}
+
+// ---------- 사용량 (3단계) ----------
+
+export type UsageRole = "pm" | "worker" | "review";
+
+/** 출처별 기록 수를 함께 담는다. costUsd가 null이면 "미제공"(0원이 아님). */
+export interface UsageTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number | null;
+  reported: number;
+  partial: number;
+  unavailable: number;
+}
+
+export interface RunUsage {
+  runId: number;
+  attempt: number;
+  role: UsageRole;
+  totals: UsageTotals;
+}
+
+export interface UsageGroup {
+  key: string;
+  label: string;
+  totals: UsageTotals;
+}
+
+export interface UsageSummary {
+  totals: UsageTotals;
+  byRole: UsageGroup[];
+  byAgent: UsageGroup[];
+  runCount: number;
+  authKinds: string[];
+}
+
+export interface RateLimitWindow {
+  name: string;
+  utilization: number;
+  resetsAt: number | null;
+}
+
+export interface RateLimitSnapshot {
+  status: string | null;
+  windows: RateLimitWindow[];
+  observedAt: number;
+}
+
 export type RunEventBody =
-  | { kind: "started"; sessionId: string; model: string | null }
+  | { kind: "started"; sessionId: string; model: string | null; auth?: string | null }
   | { kind: "user_message"; text: string }
   | { kind: "text"; text: string }
   | { kind: "tool_use"; toolUseId: string; name: string; summary: string }
@@ -167,6 +229,7 @@ export type RunEventBody =
       usage: Usage;
       durationMs: number | null;
       numTurns: number | null;
+      sessionTotals?: SessionTotals | null;
     }
   | { kind: "stderr"; text: string }
   | { kind: "notice"; text: string };
@@ -194,6 +257,8 @@ export interface Approval {
 export const EVENTS = {
   runEvent: "run-event",
   runUpdated: "run-updated",
+  usageUpdated: "usage-updated",
+  rateLimitUpdated: "rate-limit-updated",
 } as const;
 
 export const api = {
@@ -222,6 +287,10 @@ export const api = {
   cancelRun: (runId: number) => invoke<void>("cancel_run", { runId }),
   respondApproval: (approvalId: number, allow: boolean) =>
     invoke<void>("respond_approval", { approvalId, allow }),
+
+  getUsageSummary: (sinceMs: number | null) => invoke<UsageSummary>("get_usage_summary", { sinceMs }),
+  getTaskUsage: (taskId: number) => invoke<RunUsage[]>("get_task_usage", { taskId }),
+  getRateLimit: () => invoke<RateLimitSnapshot | null>("get_rate_limit"),
 };
 
 /** Rust AppError는 문자열로 직렬화되어 온다. */

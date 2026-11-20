@@ -2,6 +2,42 @@
 
 ## 플랜 실행 이력
 
+### 3단계 완료: 2026-11-20
+
+**결과**: 성공
+
+**런타임 사용량 검증 결과 (Claude Code 2.1.304)**:
+- `result.usage`: 턴 단위, CLI 내부 보조 호출 **제외** (예: usage 출력 3 vs modelUsage 출력 22)
+- `result.modelUsage`, `total_cost_usd`: 세션 누적, `--resume` 후에도 **이어짐**
+- → 집계는 같은 세션 직전 기록과의 누적값 차이(delta)로 계산. 이어서 실행해도 이중 집계 없음
+- `system/init.apiKeySource == "none"` → 구독 로그인 인증
+- `rate_limit_event.unifiedWindows`: 계정 전체 구독 한도 사용률 (five_hour, seven_day)
+- haiku 단순 질의 첫 실행도 정가 환산 ~$0.02 (대부분 시스템 프롬프트 캐시 생성) → 7단계 기준선 측정 필요
+
+**실제 변경 파일**:
+- `db/migrations.rs` — v3: `runs.role`, `runs.auth_kind`, `usage_records`(턴별 delta + 세션 누적 스냅샷)
+- `runtime/mod.rs`, `runtime/claude_code.rs` — `SessionTotals`, `RateLimitSnapshot`, `Started.auth`, 턴 비용 필드에 누적값을 넣지 않도록 수정
+- `usage.rs` — 기록(reported/partial/unavailable), 작업·프로젝트 집계(역할별·에이전트별·기간), 구독 한도 저장, 시작 시 미제공 보충
+- `executor.rs` — 턴마다 사용량 기록, 인증 방식 저장, 구독 한도 갱신 이벤트
+- `lib.rs` — `recover_on_startup()` (interrupted 처리 + 미제공 보충)
+- `commands.rs` — `get_usage_summary`, `get_task_usage`, `get_rate_limit`
+- `src/components/Usage.tsx`, `src/screens/UsageScreen.tsx` — 출처 배지, 사용량 표, 구독 한도 미터
+- `src/screens/Tasks.tsx` — 상태별 필터(작업 보드), 실행별 사용량 패널
+
+**계획과의 차이**:
+- 출처 구분을 `runtime_reported/estimated/unavailable` → `reported/partial/unavailable`로 변경. 런타임이 수치를 주므로 Mefice가 추정할 일이 없고, "턴 사용량만 있는 경우"가 실제로 필요한 구분이었음
+- 구독 한도 사용률 표시 추가 (계획에 없었지만 스펙 5장 "구독 한도와 API 가격 구분"에 필요)
+- 2단계에서 저장된 실행은 사용량을 소급 계산하지 않음 (해당 실행 데이터 0건)
+
+**검증**:
+- 단위 테스트 27개 통과 (누적값 차이, 재개 시 이중 집계 방지, 미제공·부분 구분, 기간 필터, 강제 종료 후 파일 DB 재시작 복원), clippy 경고 0, `pnpm build` 성공
+- 실제 CLI 통합 테스트 3개 통과: 실행 1 + 이어서 실행 2의 비용 합($0.021565 + $0.010367)이 세션 누적($0.031932)과 일치, 인증 `subscription` 기록, 구독 한도 수집
+- 실제 앱 실행으로 DB v2 → v3 마이그레이션 확인
+
+**잔존 작업**:
+- PM 역할(`role = pm`) 사용량은 4단계에서 PM Run이 생기면 자동 집계
+- 검토(`review`) 역할은 리뷰어 위임이 생기는 단계에서 지정
+
 ### 2단계 완료: 2026-11-20
 
 **결과**: 성공

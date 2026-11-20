@@ -23,6 +23,7 @@ use crate::runtime::{Parsed, RunEvent};
 use crate::settings;
 use crate::sysproc::resolve_binary;
 use crate::task::{self, RunStatus};
+use crate::usage;
 
 /// 중단 요청 후 런타임이 스스로 끝나기를 기다리는 시간
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
@@ -31,6 +32,10 @@ const MAX_STDERR_EVENTS: usize = 50;
 
 pub const EVENT_RUN_EVENT: &str = "run-event";
 pub const EVENT_RUN_UPDATED: &str = "run-updated";
+/// 사용량 기록 변경 (payload: task_id)
+pub const EVENT_USAGE_UPDATED: &str = "usage-updated";
+/// 구독 한도 사용률 갱신 (payload: RateLimitSnapshot)
+pub const EVENT_RATE_LIMIT: &str = "rate-limit-updated";
 
 /// 실행 중인 Run에 보내는 제어 메시지
 enum Control {
@@ -250,6 +255,11 @@ impl<R: Runtime> Executor<R> {
                 outcome.exit_code,
                 outcome.error.as_deref(),
             );
+            // 런타임이 사용량을 한 번도 주지 않은 Run은 "미제공"으로 남긴다 (0으로 가정하지 않음)
+            if let Ok(run) = task::get_run(&conn, run_id) {
+                let _ = usage::mark_unavailable_if_empty(&conn, run_id, &run.role);
+                let _ = self.app.emit(EVENT_USAGE_UPDATED, run.task_id);
+            }
         }
         self.notify_run(run_id);
         self.pump();
@@ -303,6 +313,7 @@ impl<R: Runtime> Executor<R> {
         write_line(&mut stdin, &claude_code::encode_initialize()).await;
         write_line(&mut stdin, &claude_code::encode_user_message(&run.prompt)).await;
 
+        let mut current_session = session_id.clone();
         let mut pending_turns: u32 = 1;
         let mut cancel_requested = false;
         let mut kill_deadline: Option<Instant> = None;
@@ -319,12 +330,23 @@ impl<R: Runtime> Executor<R> {
                         match parsed {
                             Parsed::Event(ev) => {
                                 match &ev {
-                                    RunEvent::Started { session_id, .. } => {
+                                    RunEvent::Started { session_id, auth, .. } => {
+                                        current_session = session_id.clone();
                                         if let Ok(c) = self.db().conn() {
                                             let _ = task::set_run_session(&c, run_id, session_id);
+                                            if let Some(a) = auth {
+                                                let _ = task::set_run_auth(&c, run_id, a);
+                                            }
                                         }
                                     }
-                                    RunEvent::TurnResult { is_error, result, subtype, .. } => {
+                                    RunEvent::TurnResult { is_error, result, subtype, usage: turn, session_totals, .. } => {
+                                        let recorded = self.db().conn().and_then(|c| usage::record_turn(
+                                            &c, run_id, Some(&current_session), &run.role, turn, session_totals.as_ref(),
+                                        ));
+                                        match recorded {
+                                            Ok(()) => { let _ = self.app.emit(EVENT_USAGE_UPDATED, run.task_id); }
+                                            Err(e) => eprintln!("[executor] 사용량 기록 실패 run={run_id}: {e}"),
+                                        }
                                         pending_turns = pending_turns.saturating_sub(1);
                                         let err_text = is_error.then(|| result.clone().unwrap_or_else(|| subtype.clone()));
                                         last_result = Some((*is_error, err_text));
@@ -359,6 +381,13 @@ impl<R: Runtime> Executor<R> {
                                         write_line(&mut stdin, &claude_code::encode_permission_response(&request_id, false, &input)).await;
                                     }
                                 }
+                            }
+                            Parsed::RateLimit(mut snapshot) => {
+                                snapshot.observed_at = crate::db::now_ms();
+                                if let Ok(c) = self.db().conn() {
+                                    let _ = usage::save_rate_limit(&c, &snapshot);
+                                }
+                                let _ = self.app.emit(EVENT_RATE_LIMIT, &snapshot);
                             }
                         }
                     }
@@ -674,6 +703,66 @@ mod live_tests {
                     .iter()
                     .any(|e| matches!(e, RunEvent::Notice { text } if text.contains("중단")))
             );
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn live_이어서_실행_사용량_이중집계_없음() {
+        let (env, agent_id) = setup(PermissionMode::Plan);
+        tauri::async_runtime::block_on(async {
+            let r1 = start(&env, agent_id, "숫자 하나만 답해: 1+1");
+            let done1 = wait_until(&env, r1, 90, |r| r.status.is_terminal()).await;
+            assert_eq!(done1.status, RunStatus::Succeeded, "{:?}", done1.error);
+            assert_eq!(done1.auth_kind.as_deref(), Some("subscription"));
+
+            // 같은 세션 이어서 실행
+            let r2 = {
+                let conn = env.handle.state::<Db>().inner().conn().unwrap();
+                task::create_run(
+                    &conn,
+                    task::NewRun {
+                        task_id: done1.task_id,
+                        agent_id,
+                        prompt: "방금 답에 1을 더한 숫자 하나만 답해",
+                        resume_session_id: done1.session_id.as_deref(),
+                        config: &done1.config,
+                        cwd: &done1.cwd,
+                    },
+                )
+                .unwrap()
+                .id
+            };
+            env.exec.pump();
+            let done2 = wait_until(&env, r2, 90, |r| r.status.is_terminal()).await;
+            assert_eq!(done2.status, RunStatus::Succeeded, "{:?}", done2.error);
+            assert_eq!(done2.session_id, done1.session_id);
+
+            let conn = env.handle.state::<Db>().inner().conn().unwrap();
+            let per_run = usage::task_usage(&conn, done1.task_id).unwrap();
+            let (c1, c2) = (
+                per_run[0].totals.cost_usd.unwrap(),
+                per_run[1].totals.cost_usd.unwrap(),
+            );
+            let final_cum: f64 = conn
+                .query_row(
+                    "SELECT cum_cost_usd FROM usage_records WHERE run_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [r2],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            println!("run1=${c1:.6} run2=${c2:.6} 세션 누적=${final_cum:.6}");
+            println!("run1={:?}\nrun2={:?}", per_run[0].totals, per_run[1].totals);
+            assert!(c1 > 0.0 && c2 > 0.0);
+            assert!(
+                (c1 + c2 - final_cum).abs() < 1e-9,
+                "실행별 합 = 세션 누적 (이중 집계 없음)"
+            );
+            assert_eq!(per_run[0].totals.reported + per_run[1].totals.reported, 2);
+
+            let rl = usage::load_rate_limit(&conn).unwrap();
+            println!("구독 한도: {rl:?}");
+            assert!(rl.is_some_and(|s| s.observed_at > 0));
         });
     }
 }

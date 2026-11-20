@@ -10,10 +10,14 @@ import {
   type Run,
   type StoredEvent,
   type TaskDetail,
+  type RunStatus,
+  type RunUsage,
   type TaskSummary,
   type Usage,
+  type UsageTotals,
 } from "../api";
 import { StatusBadge } from "../components/StatusBadge";
+import { SourceBadges, UsageNumbers } from "../components/Usage";
 
 interface Props {
   onGoTeam: () => void;
@@ -24,7 +28,10 @@ export function Tasks({ onGoTeam }: Props) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
+  const [filter, setFilter] = useState("all");
   const [error, setError] = useState<string | null>(null);
+  const active = FILTERS.find((f) => f.id === filter) ?? FILTERS[0];
+  const visible = tasks.filter((t) => active.match(t.latestRun?.status));
 
   const loadTasks = () => api.listTasks().then(setTasks).catch((e) => setError(errorMessage(e)));
 
@@ -58,10 +65,20 @@ export function Tasks({ onGoTeam }: Props) {
         }}
       />
       {error && <p className="error">{error}</p>}
+      <div className="row filters">
+        {FILTERS.map((f) => {
+          const count = tasks.filter((t) => f.match(t.latestRun?.status)).length;
+          return (
+            <button key={f.id} className={`chip ${filter === f.id ? "active" : ""}`} onClick={() => setFilter(f.id)}>
+              {f.label} <span className="muted">{count}</span>
+            </button>
+          );
+        })}
+      </div>
       <div className="tasks-body">
         <ul className="task-list">
-          {tasks.length === 0 && <li className="muted empty">아직 작업이 없습니다.</li>}
-          {tasks.map((t) => (
+          {visible.length === 0 && <li className="muted empty">해당하는 작업이 없습니다.</li>}
+          {visible.map((t) => (
             <li
               key={t.id}
               className={`task-item ${selected === t.id ? "active" : ""}`}
@@ -250,6 +267,8 @@ function TaskDetailPanel({ taskId }: { taskId: number }) {
 
       <Timeline events={events} />
 
+      {runId !== null && <RunUsagePanel taskId={taskId} runId={runId} />}
+
       {approvals.map((a) => (
         <ApprovalCard key={a.id} approval={a} onError={setError} />
       ))}
@@ -340,22 +359,75 @@ function EventRow({ e }: { e: StoredEvent }) {
   }
 }
 
+/** 턴 단위 토큰 (런타임 보고, 내부 보조 호출 제외). 비용은 실행 사용량 패널에서 본다. */
 function UsageLine({ u }: { u: Usage }) {
   const n = (v: number | null) => (v == null ? "-" : v.toLocaleString());
   return (
-    <span className="muted small usage">
+    <span className="muted small usage" title="이 턴의 모델 호출 토큰입니다. 내부 보조 호출은 실행 사용량에 합산됩니다.">
       {" "}
       · 입력 {n(u.inputTokens)} / 출력 {n(u.outputTokens)} / 캐시 읽기 {n(u.cacheReadTokens)} / 캐시 생성{" "}
       {n(u.cacheCreationTokens)}
-      {u.costUsd != null && (
-        <span title="런타임이 보고한 세션 누적 API 정가 환산값입니다. 구독 사용량과 다릅니다.">
-          {" "}
-          · ${u.costUsd.toFixed(4)} (정가 환산)
-        </span>
-      )}
     </span>
   );
 }
+
+/** 선택한 실행과 작업 전체의 사용량 (출처 포함) */
+function RunUsagePanel({ taskId, runId }: { taskId: number; runId: number }) {
+  const [rows, setRows] = useState<RunUsage[]>([]);
+
+  useEffect(() => {
+    const load = () => api.getTaskUsage(taskId).then(setRows).catch(() => {});
+    load();
+    const un = listen<number>(EVENTS.usageUpdated, ({ payload }) => {
+      if (payload === taskId) load();
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, [taskId]);
+
+  const cur = rows.find((r) => r.runId === runId);
+  if (!cur) return null;
+  const total = rows.reduce<UsageTotals>(
+    (acc, r) => ({
+      inputTokens: acc.inputTokens + r.totals.inputTokens,
+      outputTokens: acc.outputTokens + r.totals.outputTokens,
+      cacheReadTokens: acc.cacheReadTokens + r.totals.cacheReadTokens,
+      cacheCreationTokens: acc.cacheCreationTokens + r.totals.cacheCreationTokens,
+      costUsd:
+        acc.costUsd == null && r.totals.costUsd == null ? null : (acc.costUsd ?? 0) + (r.totals.costUsd ?? 0),
+      reported: acc.reported + r.totals.reported,
+      partial: acc.partial + r.totals.partial,
+      unavailable: acc.unavailable + r.totals.unavailable,
+    }),
+    { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: null, reported: 0, partial: 0, unavailable: 0 },
+  );
+
+  return (
+    <details className="run-usage">
+      <summary className="row small">
+        <span>실행 #{cur.attempt} 사용량</span>
+        <UsageNumbers t={cur.totals} compact />
+        <SourceBadges t={cur.totals} />
+      </summary>
+      {rows.length > 1 && (
+        <div className="row small">
+          <span className="muted">작업 전체 ({rows.length}회 실행)</span>
+          <UsageNumbers t={total} compact />
+        </div>
+      )}
+    </details>
+  );
+}
+
+const FILTERS: { id: string; label: string; match: (s: RunStatus | undefined) => boolean }[] = [
+  { id: "all", label: "전체", match: () => true },
+  { id: "active", label: "진행", match: (s) => s === "running" || s === "cancelling" },
+  { id: "waiting", label: "입력·승인 대기", match: (s) => s === "waiting_for_input" || s === "waiting_for_approval" },
+  { id: "queued", label: "대기", match: (s) => s === "queued" },
+  { id: "done", label: "완료", match: (s) => s === "succeeded" },
+  { id: "failed", label: "실패·중단", match: (s) => s === "failed" || s === "cancelled" || s === "interrupted" },
+];
 
 function ApprovalCard({ approval, onError }: { approval: Approval; onError: (m: string) => void }) {
   const [busy, setBusy] = useState(false);

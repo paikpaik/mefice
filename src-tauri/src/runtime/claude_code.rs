@@ -14,7 +14,10 @@ use std::path::Path;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{Parsed, RunConfig, RunEvent, Usage, truncate_chars};
+use super::{
+    Parsed, RateLimitSnapshot, RateLimitWindow, RunConfig, RunEvent, SessionTotals, Usage,
+    truncate_chars,
+};
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 2000;
 const SUMMARY_CHARS: usize = 300;
@@ -122,6 +125,47 @@ fn tool_result_text(content: &Value) -> String {
     }
 }
 
+/// `result.modelUsage`(모델별 세션 누적)를 합산한다. 검증(2.1.304): `--resume` 후에도 누적이 이어진다.
+fn parse_session_totals(v: &Value) -> Option<SessionTotals> {
+    let models = v.get("modelUsage")?.as_object()?;
+    let mut t = SessionTotals {
+        cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+        ..Default::default()
+    };
+    for (name, m) in models {
+        t.input_tokens += u64_at(m, "inputTokens").unwrap_or(0);
+        t.output_tokens += u64_at(m, "outputTokens").unwrap_or(0);
+        t.cache_read_tokens += u64_at(m, "cacheReadInputTokens").unwrap_or(0);
+        t.cache_creation_tokens += u64_at(m, "cacheCreationInputTokens").unwrap_or(0);
+        t.models.push(name.clone());
+    }
+    Some(t)
+}
+
+fn parse_rate_limit(v: &Value) -> Option<RateLimitSnapshot> {
+    let info = v.get("rate_limit_info")?;
+    let windows = info
+        .get("unifiedWindows")
+        .and_then(Value::as_object)
+        .map(|w| {
+            w.iter()
+                .filter_map(|(name, x)| {
+                    Some(RateLimitWindow {
+                        name: name.clone(),
+                        utilization: x.get("utilization")?.as_f64()?,
+                        resets_at: x.get("resetsAt").and_then(Value::as_i64),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(RateLimitSnapshot {
+        status: str_at(info, "status"),
+        windows,
+        observed_at: 0,
+    })
+}
+
 /// stdout 한 줄을 해석한다. 해석할 수 없는 줄은 빈 Vec.
 pub fn parse_line(line: &str) -> Vec<Parsed> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -134,10 +178,25 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
     match (ty, subtype) {
         ("system", "init") => {
             if let Some(session_id) = str_at(&v, "session_id") {
+                // apiKeySource가 "none"이면 API 키 없이 로그인(구독) 인증으로 실행 중
+                let auth = v.get("apiKeySource").and_then(Value::as_str).map(|s| {
+                    if s == "none" {
+                        "subscription"
+                    } else {
+                        "api_key"
+                    }
+                    .to_string()
+                });
                 out.push(Parsed::Event(RunEvent::Started {
                     session_id,
                     model: str_at(&v, "model"),
+                    auth,
                 }));
+            }
+        }
+        ("rate_limit_event", _) => {
+            if let Some(snapshot) = parse_rate_limit(&v) {
+                out.push(Parsed::RateLimit(snapshot));
             }
         }
         ("system", "permission_denied") => out.push(Parsed::Event(RunEvent::PermissionDenied {
@@ -199,10 +258,12 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
                     output_tokens: u64_at(&u, "output_tokens"),
                     cache_read_tokens: u64_at(&u, "cache_read_input_tokens"),
                     cache_creation_tokens: u64_at(&u, "cache_creation_input_tokens"),
-                    cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+                    // total_cost_usd는 세션 누적값이므로 턴 사용량에 넣지 않는다 (session_totals 참조)
+                    cost_usd: None,
                 },
                 duration_ms: u64_at(&v, "duration_ms"),
                 num_turns: u64_at(&v, "num_turns"),
+                session_totals: parse_session_totals(&v),
             }));
         }
         ("control_request", _) => {
@@ -229,12 +290,13 @@ mod tests {
 
     #[test]
     fn init_파싱() {
-        let line = r#"{"type":"system","subtype":"init","session_id":"s-1","model":"claude-haiku-5-5","tools":["Read"]}"#;
+        let line = r#"{"type":"system","subtype":"init","session_id":"s-1","model":"claude-haiku-5-5","tools":["Read"],"apiKeySource":"none"}"#;
         assert_eq!(
             parse_line(line),
             vec![Parsed::Event(RunEvent::Started {
                 session_id: "s-1".into(),
-                model: Some("claude-haiku-5-5".into())
+                model: Some("claude-haiku-5-5".into()),
+                auth: Some("subscription".into()),
             })]
         );
     }
@@ -292,6 +354,43 @@ mod tests {
     }
 
     #[test]
+    fn 세션_누적_사용량은_모델별_합산() {
+        // 2.1.304 실제 출력에서 발췌 (재개 후 두 번째 결과)
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.00121088,
+            "usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5318,"cache_creation_input_tokens":0},
+            "modelUsage":{"claude-haiku-5-5":{"inputTokens":10,"outputTokens":25,"cacheReadInputTokens":6988,"cacheCreationInputTokens":3600,"costUSD":0.00121088},
+                          "claude-other":{"inputTokens":1,"outputTokens":5,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}"#;
+        match &parse_line(line)[0] {
+            Parsed::Event(RunEvent::TurnResult {
+                session_totals: Some(t),
+                usage,
+                ..
+            }) => {
+                assert_eq!(usage.output_tokens, Some(3), "턴 사용량은 그대로");
+                assert_eq!(usage.cost_usd, None, "누적 비용을 턴 비용으로 쓰지 않음");
+                assert_eq!((t.input_tokens, t.output_tokens), (11, 30));
+                assert_eq!(t.cost_usd, Some(0.00121088));
+                assert_eq!(t.models.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn 구독_한도_이벤트_파싱() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.18,"resetsAt":1795149000},"seven_day":{"utilization":0.52,"resetsAt":1795460400}}}}"#;
+        match &parse_line(line)[0] {
+            Parsed::RateLimit(s) => {
+                assert_eq!(s.status.as_deref(), Some("allowed"));
+                let five = s.windows.iter().find(|w| w.name == "five_hour").unwrap();
+                assert_eq!(five.utilization, 0.18);
+                assert_eq!(five.resets_at, Some(1795149000));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn result_사용량_파싱() {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"hello","total_cost_usd":0.0042,
             "duration_ms":1985,"num_turns":2,
@@ -300,7 +399,7 @@ mod tests {
             Parsed::Event(RunEvent::TurnResult { usage, result, .. }) => {
                 assert_eq!(result.as_deref(), Some("hello"));
                 assert_eq!(usage.cache_read_tokens, Some(64048));
-                assert_eq!(usage.cost_usd, Some(0.0042));
+                assert_eq!(usage.cost_usd, None);
             }
             other => panic!("{other:?}"),
         }
@@ -308,7 +407,7 @@ mod tests {
 
     #[test]
     fn 모르는_이벤트와_깨진_줄은_무시() {
-        assert!(parse_line(r#"{"type":"rate_limit_event"}"#).is_empty());
+        assert!(parse_line(r#"{"type":"stream_event"}"#).is_empty());
         assert!(parse_line(r#"{"type":"system","subtype":"hook_started"}"#).is_empty());
         assert!(parse_line("not json").is_empty());
     }

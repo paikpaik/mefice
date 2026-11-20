@@ -13,9 +13,10 @@ use crate::env_check::{self, EnvironmentReport};
 use crate::error::{AppError, AppResult};
 use crate::executor::Executor;
 use crate::project::{self, Project, ProjectView};
-use crate::runtime::RunConfig;
+use crate::runtime::{RateLimitSnapshot, RunConfig};
 use crate::settings::{self, AppSettings};
 use crate::task::{self, Approval, Run, StoredEvent, Task, TaskSummary};
+use crate::usage;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -317,4 +318,28 @@ pub async fn respond_approval(
     allow: bool,
 ) -> AppResult<()> {
     executor.respond_approval(approval_id, allow)
+}
+
+// ---------- 사용량 (3단계) ----------
+
+/// 현재 프로젝트 사용량 요약. `since_ms`(epoch ms) 이후만 집계, 없으면 전체 기간.
+#[tauri::command]
+pub async fn get_usage_summary(
+    db: State<'_, Db>,
+    since_ms: Option<i64>,
+) -> AppResult<usage::UsageSummary> {
+    let conn = db.conn()?;
+    let project = current_project(&conn)?;
+    usage::summary(&conn, project.id, since_ms)
+}
+
+#[tauri::command]
+pub async fn get_task_usage(db: State<'_, Db>, task_id: i64) -> AppResult<Vec<usage::RunUsage>> {
+    usage::task_usage(&*db.conn()?, task_id)
+}
+
+/// 마지막으로 관측한 구독 한도 사용률 (계정 전체, Mefice 외 사용 포함)
+#[tauri::command]
+pub async fn get_rate_limit(db: State<'_, Db>) -> AppResult<Option<RateLimitSnapshot>> {
+    usage::load_rate_limit(&*db.conn()?)
 }
