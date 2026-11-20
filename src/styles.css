@@ -1,0 +1,145 @@
+:root {
+  --bg: #f6f6f4;
+  --surface: #ffffff;
+  --border: #e2e2de;
+  --text: #1d1d1b;
+  --muted: #6d6d68;
+  --accent: #3a6df0;
+  --accent-text: #ffffff;
+  --ok: #2f8a4c;
+  --warn: #b7791f;
+  --danger: #c53030;
+  --radius: 8px;
+  font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Pretendard", sans-serif;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #18181a;
+    --surface: #222225;
+    --border: #36363a;
+    --text: #ececea;
+    --muted: #9a9a96;
+    --accent: #6b93ff;
+    --ok: #5cc27e;
+    --warn: #e0a84a;
+    --danger: #f07070;
+  }
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); }
+
+button, select, textarea, input {
+  font: inherit;
+  color: inherit;
+}
+button {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+
+select, textarea {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+textarea { width: 100%; resize: vertical; }
+
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.error { color: var(--danger); }
+.hint { color: var(--muted); font-size: 12px; }
+.row { display: flex; align-items: center; gap: 8px; }
+.center { display: grid; place-items: center; height: 100vh; }
+
+/* 시작 화면 */
+.welcome {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+}
+.welcome h1 { margin: 0; font-size: 32px; }
+
+/* 기본 레이아웃 */
+.shell { display: grid; grid-template-columns: 200px 1fr; height: 100vh; }
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 12px;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+.brand { font-weight: 700; font-size: 16px; margin-bottom: 8px; }
+.project-chip {
+  font-size: 12px;
+  padding: 6px 8px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nav-item { text-align: left; border: none; background: transparent; }
+.nav-item.active { background: var(--bg); font-weight: 600; }
+.content { overflow: auto; padding: 24px; }
+
+/* 카드·폼 */
+.settings { display: flex; flex-direction: column; gap: 16px; max-width: 860px; }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+}
+.card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.card-header h2 { margin: 0; font-size: 16px; }
+.kv { display: grid; grid-template-columns: 80px 1fr; gap: 6px 12px; margin: 0 0 16px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; word-break: break-all; }
+.field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.field.inline { flex-direction: row; align-items: center; gap: 10px; }
+
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.badge.ok { color: var(--ok); border-color: var(--ok); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.badge.danger { color: var(--danger); border-color: var(--danger); }
+
+.table { width: 100%; border-collapse: collapse; }
+.table th, .table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.table th { color: var(--muted); font-weight: 500; font-size: 12px; }
+
+.placeholder {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+.placeholder h2 { margin: 0; }
