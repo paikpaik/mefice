@@ -38,7 +38,7 @@ impl RunStatus {
         }
     }
 
-    fn from_db(s: &str) -> Self {
+    pub fn from_db(s: &str) -> Self {
         match s {
             "queued" => Self::Queued,
             "running" => Self::Running,
@@ -449,6 +449,8 @@ pub struct NewRun<'a> {
 }
 
 /// 새 실행 시도를 queued 상태로 만든다. 재실행·이어서 실행도 항상 새 Run이다 (스펙 8장).
+/// 테스트 전용: 운영 코드는 에이전트 설정에 맞는 역할로 `create_run_with_role`을 쓴다.
+#[cfg(test)]
 pub fn create_run(conn: &Connection, n: NewRun) -> AppResult<Run> {
     create_run_with_role(conn, n, "worker")
 }
@@ -766,6 +768,7 @@ mod tests {
                 permission_mode: PermissionMode::Default,
                 tools: agent::default_tools(),
                 color: None,
+                profile: Default::default(),
             },
         )
         .unwrap();
@@ -778,6 +781,7 @@ mod tests {
             tools: vec!["Read".into()],
             system_append: String::new(),
             json_schema: None,
+            limits: Default::default(),
         };
         (p.id, a.id, cfg)
     }

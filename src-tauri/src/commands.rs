@@ -109,6 +109,7 @@ pub async fn list_agents(db: State<'_, Db>) -> AppResult<Vec<Agent>> {
     let conn = db.conn()?;
     // PM은 항상 팀에 있다 (모델 등 설정을 첫 대화 전에 바꿀 수 있도록). 생성·대기에 토큰은 들지 않는다.
     agent::ensure_pm(&conn)?;
+    agent::assign_missing_desks(&conn)?;
     agent::list(&conn)
 }
 
@@ -172,7 +173,7 @@ pub async fn start_direct_task(
             task::set_isolation(&conn, task.id, task::ISOLATION_WORKTREE)?;
         }
         let task = task::get_task(&conn, task.id)?;
-        task::create_run(
+        task::create_run_with_role(
             &conn,
             task::NewRun {
                 task_id: task.id,
@@ -182,6 +183,7 @@ pub async fn start_direct_task(
                 config: &pm::run_config(&project, &agent),
                 cwd: &project.path,
             },
+            agent.usage_role(),
         )?;
         summary(&conn, task)?
     };
@@ -245,7 +247,8 @@ fn new_run_for_task(db: &Db, task_id: i64, follow_up: Option<String>) -> AppResu
         }
         None => (task.prompt.as_str(), None),
     };
-    task::create_run(
+    // PM 목표를 작업 화면에서 이어서·다시 실행해도 PM Run으로 기록된다 (결정 처리·사용량 구분)
+    task::create_run_with_role(
         &conn,
         task::NewRun {
             task_id,
@@ -255,6 +258,7 @@ fn new_run_for_task(db: &Db, task_id: i64, follow_up: Option<String>) -> AppResu
             config: &pm::run_config(&project, &agent),
             cwd: &project.path,
         },
+        agent.usage_role(),
     )
 }
 
@@ -478,4 +482,28 @@ pub async fn merge_task(app: tauri::AppHandle, task_id: i64) -> AppResult<String
 #[tauri::command]
 pub async fn discard_task_workspace(app: tauri::AppHandle, task_id: i64) -> AppResult<()> {
     with_db_blocking(app, move |c| workspace::discard(c, task_id)).await
+}
+
+// ---------- 고용 · 사무실 (6단계) ----------
+
+#[tauri::command]
+pub async fn list_templates() -> AppResult<crate::templates::TemplateCatalog> {
+    Ok(crate::templates::catalog())
+}
+
+/// 사무실 캐릭터 상태 (DB 조회만, 모델 호출 없음)
+#[tauri::command]
+pub async fn get_office_state(db: State<'_, Db>) -> AppResult<Vec<crate::office::OfficeAgent>> {
+    let conn = db.conn()?;
+    agent::ensure_pm(&conn)?;
+    agent::assign_missing_desks(&conn)?;
+    crate::office::office_state(&conn)
+}
+
+#[tauri::command]
+pub async fn get_agent_overview(
+    db: State<'_, Db>,
+    agent_id: i64,
+) -> AppResult<crate::office::AgentOverview> {
+    crate::office::agent_overview(&*db.conn()?, agent_id)
 }

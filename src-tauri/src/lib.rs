@@ -5,12 +5,14 @@ mod env_check;
 mod error;
 mod executor;
 mod git;
+mod office;
 mod pm;
 mod project;
 mod runtime;
 mod settings;
 mod sysproc;
 mod task;
+mod templates;
 mod usage;
 mod workspace;
 
@@ -74,6 +76,9 @@ pub fn run() {
             commands::get_task_diff,
             commands::merge_task,
             commands::discard_task_workspace,
+            commands::list_templates,
+            commands::get_office_state,
+            commands::get_agent_overview,
         ])
         .run(tauri::generate_context!())
         .expect("Mefice 실행 중 오류가 발생했습니다");
@@ -150,6 +155,7 @@ mod restore_tests {
                     permission_mode: PermissionMode::Default,
                     tools: agent::default_tools(),
                     color: None,
+                    profile: Default::default(),
                 },
             )
             .unwrap();
@@ -162,6 +168,7 @@ mod restore_tests {
                 tools: vec![],
                 system_append: String::new(),
                 json_schema: None,
+                limits: Default::default(),
             };
             let mk = |prompt: &str| {
                 let t = task::create_task(&conn, p.id, a.id, prompt).unwrap();

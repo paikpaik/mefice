@@ -145,6 +145,19 @@ pub fn run_config(project: &Project, agent: &Agent) -> RunConfig {
             agent.role, agent.name
         )
     };
+    let pf = &agent.profile;
+    if !pf.specialties.is_empty() {
+        sys.push_str(&format!("\n전문 분야: {}", pf.specialties.join(", ")));
+    }
+    if !pf.capabilities.is_empty() {
+        sys.push_str(&format!("\n수행 능력: {}", pf.capabilities.join(", ")));
+    }
+    if !pf.scope_paths.is_empty() {
+        sys.push_str(&format!(
+            "\n작업 범위: {} (이 범위 밖은 수정하지 마세요)",
+            pf.scope_paths.join(", ")
+        ));
+    }
     if !agent.instructions.trim().is_empty() {
         sys.push_str("\n\n## 역할 지침\n");
         sys.push_str(agent.instructions.trim());
@@ -162,6 +175,7 @@ pub fn run_config(project: &Project, agent: &Agent) -> RunConfig {
         tools: agent.tools.clone(),
         system_append: sys,
         json_schema: agent.is_pm().then(|| PM_SCHEMA.to_string()),
+        limits: agent.profile.limits.clone(),
     }
 }
 
@@ -184,16 +198,21 @@ pub fn team_summary(conn: &Connection) -> AppResult<String> {
     Ok(workers
         .iter()
         .map(|a| {
-            let extra = if a.instructions.trim().is_empty() {
-                String::new()
-            } else {
-                format!(
+            let mut extra = String::new();
+            if !a.profile.specialties.is_empty() {
+                extra.push_str(&format!(" · 전문 {}", a.profile.specialties.join("/")));
+            }
+            if !a.profile.scope_paths.is_empty() {
+                extra.push_str(&format!(" · 범위 {}", a.profile.scope_paths.join(",")));
+            }
+            if !a.instructions.trim().is_empty() {
+                extra.push_str(&format!(
                     " · {}",
                     truncate_chars(a.instructions.trim(), 80)
                         .0
                         .replace('\n', " ")
-                )
-            };
+                ));
+            }
             format!(
                 "- agentId {}: {} ({}) · 도구 {} · {}{}",
                 a.id,
@@ -673,7 +692,7 @@ fn create_plan(
             .iter()
             .find(|a| a.id == p.task.agent_id)
             .expect("검증된 팀원");
-        task::create_run(
+        task::create_run_with_role(
             conn,
             task::NewRun {
                 task_id: p.task.id,
@@ -683,6 +702,7 @@ fn create_plan(
                 config: &run_config(&project, worker),
                 cwd: &project.path,
             },
+            worker.usage_role(),
         )?;
         fx.queued = true;
         let deps = task::dependencies(conn, p.task.id)?;
@@ -840,6 +860,7 @@ mod tests {
                 permission_mode: PermissionMode::AcceptEdits,
                 tools: vec!["Read".into(), "Edit".into()],
                 color: None,
+                profile: Default::default(),
             },
         )
         .unwrap()

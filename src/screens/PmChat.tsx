@@ -18,6 +18,7 @@ import {
 import { StatusBadge } from "../components/StatusBadge";
 import { IntegrationBadge } from "../components/DiffPanel";
 import { fmtCost, fmtTokens } from "../components/Usage";
+import { inputFromTemplate, templateForRole } from "../office/hire";
 
 const MODE_LABEL: Record<PmMode, string> = {
   direct: "직접 처리",
@@ -255,14 +256,13 @@ function HireCard({ hire }: { hire: NonNullable<PmDecision["hire"]> }) {
     setError(null);
     const tools = hire.tools.filter((t) => (ALL_TOOLS as readonly string[]).includes(t));
     try {
+      // PM이 제안한 역할에 가까운 템플릿의 기본값(지침·권한·외형)으로 고용하고, 이름·자리는 로컬에서 정한다
+      const [{ templates }, agents] = await Promise.all([api.listTemplates(), api.listAgents()]);
+      const input = inputFromTemplate(templateForRole(hire.role, templates), agents);
       await api.createAgent({
-        name: hire.role,
+        ...input,
         role: hire.role,
-        instructions: "",
-        model: null,
-        effort: null,
-        permissionMode: "default",
-        tools: tools.length ? tools : [...ALL_TOOLS],
+        tools: tools.length ? tools : input.tools,
       });
       setState("done");
     } catch (e) {

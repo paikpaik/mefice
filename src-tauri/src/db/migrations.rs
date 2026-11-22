@@ -175,6 +175,10 @@ const MIGRATIONS: &[&str] = &[
         removed_at   INTEGER
     );
     "#,
+    // v6: 고용 프로필 (6단계: 외형·자리·전문 분야·수행 능력·작업 범위·제한)
+    r#"
+    ALTER TABLE agents ADD COLUMN profile TEXT NOT NULL DEFAULT '{}';
+    "#,
 ];
 
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {

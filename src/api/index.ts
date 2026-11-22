@@ -54,6 +54,38 @@ export interface EnvironmentReport {
 export type PermissionMode = "default" | "acceptEdits" | "plan";
 export const ALL_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash"] as const;
 
+/** 실행 제한 (스펙 4.3) */
+export interface Limits {
+  /** 실행 시간(분) */
+  maxMinutes: number | null;
+  /** 사용량 상한 (API 정가 환산 USD) */
+  maxBudgetUsd: number | null;
+  /** 에이전트 턴 수 상한 */
+  maxTurns: number | null;
+}
+
+/** 고용 프로필: 외형·자리·전문 분야·수행 능력·작업 범위·제한 */
+export interface AgentProfile {
+  templateId: string | null;
+  avatar: string;
+  /** 0부터 시작하는 책상 번호. null이면 자동 배정 */
+  desk: number | null;
+  specialties: string[];
+  capabilities: string[];
+  scopePaths: string[];
+  limits: Limits;
+}
+
+export const emptyProfile = (): AgentProfile => ({
+  templateId: null,
+  avatar: "a",
+  desk: null,
+  specialties: [],
+  capabilities: [],
+  scopePaths: [],
+  limits: { maxMinutes: null, maxBudgetUsd: null, maxTurns: null },
+});
+
 export interface Agent {
   id: number;
   name: string;
@@ -66,6 +98,7 @@ export interface Agent {
   color: string;
   /** pm | worker */
   kind: "pm" | "worker";
+  profile: AgentProfile;
   createdAt: number;
   updatedAt: number;
 }
@@ -79,6 +112,51 @@ export interface AgentInput {
   permissionMode: PermissionMode;
   tools: string[];
   color?: string | null;
+  profile: AgentProfile;
+}
+
+// ---------- 고용 · 사무실 (6단계) ----------
+
+export interface AgentTemplate {
+  id: string;
+  role: string;
+  summary: string;
+  instructions: string;
+  tools: string[];
+  permissionMode: PermissionMode;
+  specialtySuggestions: string[];
+  capabilities: string[];
+  color: string;
+  avatar: string;
+}
+
+export interface TemplateCatalog {
+  templates: AgentTemplate[];
+  capabilities: string[];
+  deskCount: number;
+}
+
+export type OfficeState = "idle" | "queued" | "working" | "needs_input" | "error" | "done";
+
+export interface RunRef {
+  runId: number;
+  taskId: number;
+  taskTitle: string;
+  status: RunStatus;
+  endedAt: number | null;
+}
+
+export interface OfficeAgent {
+  agent: Agent;
+  state: OfficeState;
+  active: RunRef[];
+  last: RunRef | null;
+}
+
+export interface AgentOverview {
+  agent: Agent;
+  recent: TaskSummary[];
+  usage: UsageTotals;
 }
 
 // ---------- 작업·실행 ----------
@@ -401,6 +479,10 @@ export const api = {
   pmSend: (goalId: number | null, text: string) => invoke<number>("pm_send", { goalId, text }),
 
   getTaskDiff: (taskId: number) => invoke<TaskDiff>("get_task_diff", { taskId }),
+  listTemplates: () => invoke<TemplateCatalog>("list_templates"),
+  getOfficeState: () => invoke<OfficeAgent[]>("get_office_state"),
+  getAgentOverview: (agentId: number) => invoke<AgentOverview>("get_agent_overview", { agentId }),
+
   /** 사용자 현재 브랜치에 병합. 반환값은 병합 커밋 */
   mergeTask: (taskId: number) => invoke<string>("merge_task", { taskId }),
   discardTaskWorkspace: (taskId: number) => invoke<void>("discard_task_workspace", { taskId }),

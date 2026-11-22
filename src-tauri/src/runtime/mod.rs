@@ -27,6 +27,9 @@ pub struct RunConfig {
     /// 최종 응답을 이 JSON Schema로 강제한다 (PM 결정 등). 3단계 이전 스냅샷에는 없음.
     #[serde(default)]
     pub json_schema: Option<String>,
+    /// 실행 제한 (6단계 이전 스냅샷에는 없음)
+    #[serde(default)]
+    pub limits: crate::agent::Limits,
 }
 
 /// 사용량. 런타임이 제공한 값만 채우고, 없으면 None (추정하지 않음).

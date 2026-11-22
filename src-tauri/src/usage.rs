@@ -299,6 +299,15 @@ pub fn goal_usage(conn: &Connection, goal_id: i64) -> AppResult<Vec<Grouped>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// 에이전트 한 명의 전체 사용량 (사무실 캐릭터 상세용)
+pub fn agent_usage(conn: &Connection, agent_id: i64) -> AppResult<UsageTotals> {
+    Ok(conn.query_row(
+        &format!("SELECT {TOTALS_SELECT} FROM usage_records u JOIN runs r ON r.id = u.run_id WHERE r.agent_id = ?1"),
+        [agent_id],
+        |r| totals_from_row(r, 0),
+    )?)
+}
+
 // ---------- 구독 한도 사용률 (계정 전체) ----------
 
 pub fn save_rate_limit(conn: &Connection, snapshot: &RateLimitSnapshot) -> AppResult<()> {
@@ -355,6 +364,7 @@ mod tests {
                 permission_mode: PermissionMode::Default,
                 tools: agent::default_tools(),
                 color: None,
+                profile: Default::default(),
             },
         )
         .unwrap();
@@ -367,6 +377,7 @@ mod tests {
             tools: vec![],
             system_append: String::new(),
             json_schema: None,
+            limits: Default::default(),
         };
         let t = task::create_task(conn, p.id, a.id, "x").unwrap();
         let mk = |resume| {

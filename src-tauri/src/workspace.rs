@@ -379,6 +379,7 @@ mod tests {
                     permission_mode: PermissionMode::Default,
                     tools: agent::default_tools(),
                     color: None,
+                    profile: Default::default(),
                 },
             )
             .unwrap();

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, errorMessage, type AppSettings, type ProjectView } from "./api";
 import { Welcome } from "./screens/Welcome";
 import { Settings } from "./screens/Settings";
-import { Placeholder } from "./screens/Placeholder";
+import { Office } from "./office/Office";
 import { Tasks } from "./screens/Tasks";
 import { PmChat } from "./screens/PmChat";
 import { Team } from "./screens/Team";
@@ -66,9 +66,7 @@ export default function App() {
         ))}
       </nav>
       <main className="content">
-        {tab === "office" && (
-          <Placeholder title="사무실" stage={6} description="고용한 에이전트가 상태에 따라 일하거나 쉬는 2D 사무실" />
-        )}
+        {tab === "office" && <Office onOpenTask={openTask} onGoTeam={() => setTab("team")} />}
         {tab === "pm" && <PmChat onOpenTask={openTask} onGoTeam={() => setTab("team")} />}
         {tab === "board" && (
           <Tasks

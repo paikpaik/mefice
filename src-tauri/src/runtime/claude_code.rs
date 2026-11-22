@@ -64,6 +64,13 @@ pub fn build_command(bin: &Path, cwd: &Path, cfg: &RunConfig, session: Session) 
     if let Some(schema) = &cfg.json_schema {
         cmd.args(["--json-schema", schema]);
     }
+    // 사용량·턴 제한은 런타임이 강제한다 (시간 제한은 실행 관리자 타이머)
+    if let Some(b) = cfg.limits.max_budget_usd {
+        cmd.args(["--max-budget-usd", &b.to_string()]);
+    }
+    if let Some(t) = cfg.limits.max_turns {
+        cmd.args(["--max-turns", &t.to_string()]);
+    }
     cmd
 }
 
@@ -89,6 +96,27 @@ pub fn encode_permission_response(request_id: &str, allow: bool, input: &Value) 
     };
     json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":response}})
         .to_string()
+}
+
+/// 런타임 제한으로 끝난 결과를 사람이 읽을 수 있는 문장으로 (검증: 2.1.304)
+pub fn describe_error(subtype: &str, limits: &crate::agent::Limits) -> Option<String> {
+    match subtype {
+        "error_max_turns" => Some(format!(
+            "턴 제한({}회)에 도달해 중단했습니다",
+            limits
+                .max_turns
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "?".into())
+        )),
+        "error_max_budget_usd" => Some(format!(
+            "사용량 상한(${}, 정가 환산)에 도달해 중단했습니다",
+            limits
+                .max_budget_usd
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "?".into())
+        )),
+        _ => None,
+    }
 }
 
 /// 도구 입력을 한 줄 요약으로 만든다 (전체 입력은 이벤트에 저장하지 않음).
@@ -419,6 +447,43 @@ mod tests {
         assert!(parse_line(r#"{"type":"stream_event"}"#).is_empty());
         assert!(parse_line(r#"{"type":"system","subtype":"hook_started"}"#).is_empty());
         assert!(parse_line("not json").is_empty());
+    }
+
+    #[test]
+    fn 제한_인자와_메시지() {
+        let mut cfg = RunConfig {
+            agent_name: "a".into(),
+            agent_role: "r".into(),
+            model: None,
+            effort: None,
+            permission_mode: crate::agent::PermissionMode::Default,
+            tools: vec!["Read".into()],
+            system_append: String::new(),
+            json_schema: None,
+            limits: Default::default(),
+        };
+        cfg.limits.max_turns = Some(7);
+        cfg.limits.max_budget_usd = Some(0.5);
+        let cmd = build_command(
+            std::path::Path::new("claude"),
+            std::path::Path::new("/tmp"),
+            &cfg,
+            Session::New("s"),
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let pos = |k: &str| args.iter().position(|a| a == k).unwrap();
+        assert_eq!(args[pos("--max-turns") + 1], "7");
+        assert_eq!(args[pos("--max-budget-usd") + 1], "0.5");
+        assert!(
+            describe_error("error_max_turns", &cfg.limits)
+                .unwrap()
+                .contains("7회")
+        );
+        assert!(describe_error("success", &cfg.limits).is_none());
     }
 
     #[test]

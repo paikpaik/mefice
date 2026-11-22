@@ -2,6 +2,57 @@
 
 ## 플랜 실행 이력
 
+### 6단계 완료: 2026-11-22
+
+**결과**: 성공
+
+**런타임 검증 (Claude Code 2.1.304)**:
+- `--max-budget-usd` → `subtype: error_max_budget_usd`, `terminal_reason: budget_exhausted`
+- `--max-turns`(도움말에 없음) → `subtype: error_max_turns`
+- 시간 제한 옵션은 없음 → 실행 관리자 타이머로 구현
+
+**설계**:
+- 역할 템플릿 5종(백엔드·프론트엔드·QA·리뷰어·조사)을 코드에 내장. 코드 수정 역할은 worktree 격리를 전제로 "편집 자동 허용", 리뷰어·조사는 읽기 전용
+- 고용 프로필(`agents.profile` JSON): 템플릿, 외형(아바타·색상), 자리, 전문 분야, 수행 능력, 작업 범위, 제한(시간·사용량·턴)
+- 전문 분야·수행 능력·작업 범위는 시스템 프롬프트와 PM 팀 요약에 반영. 작업 범위는 지침이며 권한 강제 아님
+- 수행 능력에 "코드 리뷰"가 있으면 사용량 역할을 review로 집계 (스펙 5장 선택적 검토)
+- 제한: 사용량·턴은 런타임 인자, 시간은 타이머 → 사용자 중단과 같은 절차로 멈추되 결과는 실패로 기록(PM이 실패 보고를 받도록)
+- 사무실: SVG 한 장, 캐릭터 이동은 rAF로 transform만 직접 갱신(React는 자세·말풍선 변경 시에만 렌더), 통로·책상 사이 길 경유 경로, 창 숨김 시 정지, reduced-motion 시 즉시 이동
+- 상태 매핑(스펙 4.5): 작업 없음→휴게 공간 순회, 실행 대기→자리 `…`, 작업 중→자리 타이핑, 입력 필요→`?`, 오류→`!`(10분 또는 확인 클릭까지), 완료→`✓` 8초 후 휴식
+- 상태 갱신은 run-updated 이벤트 기반(300ms 묶음), 시간 경과 판단은 로컬 시계. 백엔드 폴링·모델 호출 없음
+- 캐릭터 스프라이트는 `office/Character.tsx`로 분리 (아트 교체 지점)
+
+**실제 변경 파일**:
+- `db/migrations.rs` — v6: `agents.profile`
+- `agent.rs` — `AgentProfile`, `Limits`, 자리 자동 배정·중복 방지, `usage_role`, `assign_missing_desks`
+- `templates.rs` (신규) — 역할 템플릿·수행 능력 목록
+- `office.rs` (신규) — 에이전트별 사무실 상태·캐릭터 개요
+- `runtime/*` — `RunConfig.limits`, `--max-budget-usd`/`--max-turns`, 제한 사유 메시지
+- `executor.rs` — 시간 제한 타이머, 제한 사유 표시
+- `pm.rs` — 프로필을 지침·팀 요약에 반영, 역할별 Run 생성
+- `commands.rs` — `list_templates`, `get_office_state`, `get_agent_overview`, 직접 실행·재실행에서 `usage_role` 사용
+- `task.rs` — `create_run`을 테스트 전용으로 (역할 없이 Run 생성 방지)
+- `usage.rs` — `agent_usage`
+- `src/office/` (신규) — `Office.tsx`, `Character.tsx`, `layout.ts`, `AgentPanel.tsx`, `hire.ts`
+- `src/screens/Team.tsx` — 템플릿 선택 → 고용 양식(외형·자리·전문 분야·수행 능력·범위·도구·실행 설정·제한·지침)
+- `src/screens/PmChat.tsx` — PM 고용 제안을 템플릿 기본값으로 고용
+- `src/screens/Placeholder.tsx` 삭제, `App.tsx`, `api/index.ts`, `styles.css`
+
+**발견·수정한 버그**:
+- 작업 화면에서 PM 목표를 이어서/다시 실행하면 Run 역할이 worker로 기록되어 PM 결정 처리가 건너뛰어지던 문제 → `usage_role()`로 역할 지정
+- 사무실 엔진이 첫 렌더의 상태를 비교해 매 프레임 React 재렌더를 일으키던 문제 → 엔진 내부에 마지막 반영 값 보관
+
+**검증**:
+- 단위 테스트 51개 통과 (자리 배정·중복·기존 작업자 배정, 프로필 정리·검토 역할, 템플릿 도구 제약, 상태→캐릭터 매핑, 제한 인자·메시지), clippy 경고 0, `pnpm build` 성공
+- 실제 CLI 통합 테스트 7개 통과 (턴 제한 추가, 이전 단계 회귀 포함)
+- 화면 검증: 목 API를 붙인 검증 페이지를 헤드리스 Chrome(CDP)으로 실제 시간 3초·12초 캡처 → 상태별 말풍선, 완료 8초 후 휴식 전환, 휴게 공간 이동·통로 경유·걷기 자세, 캐릭터 상세 패널 확인
+- 실제 앱 실행으로 DB v5 → v6 마이그레이션 확인
+
+**잔존 작업**:
+- 시간 제한 타이머는 통합 테스트 없음 (분 단위라 테스트 비용이 큼). 사용자 중단 경로를 재사용하며 그 경로는 통합 테스트로 검증됨
+- 최종 아트 스타일 미정 (스펙 14장) — `Character.tsx`만 교체하면 됨
+- 사무실 꾸미기·고급 캐릭터 표현은 MVP 이후 (스펙 11장)
+
 ### 5단계 완료: 2026-11-22
 
 **결과**: 성공

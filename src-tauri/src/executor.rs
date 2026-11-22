@@ -499,6 +499,12 @@ impl<R: Runtime> Executor<R> {
         let mut pending_turns: u32 = 1;
         let mut cancel_requested = false;
         let mut kill_deadline: Option<Instant> = None;
+        // 시간 제한 (스펙 4.3). 넘으면 중단 절차를 밟고 결과는 실패로 기록한다.
+        let mut time_limit: Option<Instant> = config
+            .limits
+            .max_minutes
+            .map(|m| Instant::now() + Duration::from_secs(u64::from(m) * 60));
+        let mut limit_hit: Option<String> = None;
         let mut last_result: Option<(bool, Option<String>)> = None;
         let mut stderr_open = true;
         let mut stderr_events = 0usize;
@@ -530,7 +536,11 @@ impl<R: Runtime> Executor<R> {
                                             Err(e) => eprintln!("[executor] 사용량 기록 실패 run={run_id}: {e}"),
                                         }
                                         pending_turns = pending_turns.saturating_sub(1);
-                                        let err_text = is_error.then(|| result.clone().unwrap_or_else(|| subtype.clone()));
+                                        let err_text = is_error.then(|| {
+                                            claude_code::describe_error(subtype, &config.limits)
+                                                .or_else(|| result.clone())
+                                                .unwrap_or_else(|| subtype.clone())
+                                        });
                                         last_result = Some((*is_error, err_text));
                                         if pending_turns == 0 {
                                             stdin = None; // stdin 닫기 → 런타임 정상 종료
@@ -624,6 +634,17 @@ impl<R: Runtime> Executor<R> {
                         Some(Control::Cancel) | None => {}
                     }
                 }
+                _ = tokio::time::sleep_until(time_limit.unwrap_or_else(Instant::now)), if time_limit.is_some() && !cancel_requested => {
+                    time_limit = None;
+                    let mins = config.limits.max_minutes.unwrap_or(0);
+                    let msg = format!("시간 제한({mins}분)에 도달해 중단했습니다");
+                    self.record(run_id, RunEvent::Notice { text: msg.clone() });
+                    limit_hit = Some(msg);
+                    // 사용자 중단과 같은 절차(대기 승인 거부 → interrupt → stdin 닫기 → 유예 후 강제 종료)를 재사용
+                    if let Some(tx) = self.sender(run_id) {
+                        let _ = tx.send(Control::Cancel);
+                    }
+                }
                 _ = tokio::time::sleep_until(kill_deadline.unwrap_or_else(Instant::now)), if kill_deadline.is_some() => {
                     kill_deadline = None;
                     self.record(run_id, RunEvent::Notice { text: "응답이 없어 프로세스를 강제 종료합니다".into() });
@@ -634,6 +655,14 @@ impl<R: Runtime> Executor<R> {
 
         let exit_code = child.wait().await.ok().and_then(|s| s.code());
 
+        if let Some(msg) = limit_hit {
+            // 제한 초과는 사용자 중단이 아니라 실패로 남겨 PM이 실패 보고를 받게 한다
+            return Outcome {
+                status: RunStatus::Failed,
+                exit_code,
+                error: Some(msg),
+            };
+        }
         if cancel_requested {
             self.record(
                 run_id,
@@ -735,6 +764,7 @@ mod live_tests {
                     permission_mode: mode,
                     tools: vec!["Read".into(), "Write".into()],
                     color: None,
+                    profile: Default::default(),
                 },
             )
             .unwrap()
@@ -1255,6 +1285,47 @@ mod live_tests {
                 repo.join("x.txt").exists() && repo.join("y.txt").exists(),
                 "두 결과 모두 병합"
             );
+        });
+    }
+
+    /// 6단계: 턴 제한(--max-turns)에 걸리면 실패로 끝나고 읽을 수 있는 사유를 남긴다.
+    #[test]
+    #[ignore]
+    fn live_턴_제한() {
+        let (env, agent_id) = setup(PermissionMode::AcceptEdits);
+        {
+            let conn = env.handle.state::<Db>().inner().conn().unwrap();
+            let a = agent::get(&conn, agent_id).unwrap();
+            let mut p = a.profile.clone();
+            p.limits.max_turns = Some(1);
+            agent::update(
+                &conn,
+                agent_id,
+                &AgentInput {
+                    name: a.name,
+                    role: a.role,
+                    instructions: a.instructions,
+                    model: a.model,
+                    effort: a.effort,
+                    permission_mode: a.permission_mode,
+                    tools: a.tools,
+                    color: None,
+                    profile: p,
+                },
+            )
+            .unwrap();
+        }
+        std::fs::write(env.proj.path().join("a.txt"), "a\n").unwrap();
+        tauri::async_runtime::block_on(async {
+            let id = start(
+                &env,
+                agent_id,
+                "a.txt를 Read로 읽고, 그다음 b.txt를 Write로 만들어 같은 내용을 써.",
+            );
+            let done = wait_until(&env, id, 90, |r| r.status.is_terminal()).await;
+            println!("상태 {:?} / 사유 {:?}", done.status, done.error);
+            assert_eq!(done.status, RunStatus::Failed);
+            assert!(done.error.as_deref().unwrap_or("").contains("턴 제한(1회)"));
         });
     }
 }
