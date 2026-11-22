@@ -2,6 +2,48 @@
 
 ## 플랜 실행 이력
 
+### 5단계 완료: 2026-11-22
+
+**결과**: 성공
+
+**설계**:
+- worktree 위치: 앱 데이터 폴더 `worktrees/project-<id>/task-<id>` (계획의 `.mefice/worktrees`에서 변경 — 사용자 레포에 폴더를 만들지 않기 위해), 브랜치 `mefice/task-<id>`
+- 격리 대상: 위임 작업 + 쓰기 가능한 직접 실행(체크박스로 끌 수 있음). PM은 메인 폴더(미커밋 변경 포함 현재 상태를 봐야 함)
+- worktree는 Run 시작 시 생성, 같은 작업의 재실행·이어서 실행은 같은 경로 재사용 (런타임 세션이 cwd에 묶여 있어 경로가 바뀌면 `--resume` 불가)
+- 의존 작업은 선행 작업 브랜치 위에서 시작 (선행이 여럿이면 worktree에서 병합)
+- 실행 종료 시 Mefice 브랜치에 스냅샷 커밋(`--no-verify`, 작성자 Mefice)
+- 병합: 사용자 확정 시에만. ① `git merge-tree --write-tree`로 충돌 사전 확인(작업 트리 무변경) ② 사용자 미커밋 변경과 파일 겹침 확인 ③ 통과 시 `merge --no-ff`. `merge --abort`에 의존하지 않음(미커밋 변경 복원 불가 사례 때문)
+- PM 스키마: tasks 최대 5개 + `key`/`paths`/`dependsOn`. 경로 겹침 + 순서 없음 → Mefice가 자동 순차화. Git 격리 불가 시 쓰기 작업을 한 줄로 세움
+- 선행 작업이 성공하지 못하면 뒤 작업 취소(사유 기록), 계획 단위로 모두 끝나면 PM 1회 호출로 묶음 보고
+
+**실제 변경 파일**:
+- `db/migrations.rs` — v5: `tasks.isolation/plan_run_id/integration`, `task_dependencies`, `workspaces`
+- `git.rs` (신규) — worktree·스냅샷·diff·merge-tree 충돌 확인·미커밋 파일·병합
+- `workspace.rs` (신규) — prepare/snapshot/diff/merge/discard/snapshot_all
+- `task.rs` — 격리·계획·통합 필드, 의존성, `readiness`(Ready/Waiting/Blocked), `queued_runs`, `set_run_cwd`
+- `pm.rs` — 스키마 확장, `create_plan`(병렬·순서·겹침·격리), 계획 단위 묶음 보고, git 기준 변경 파일
+- `agent.rs` — `can_write`
+- `executor.rs` — 의존성 기반 스케줄링·차단 취소, 작업 공간 준비(시스템 프롬프트에 커밋 금지 안내), 종료 스냅샷, worktree 루트
+- `commands.rs` — `start_direct_task(isolated)`, `get_task_diff`, `merge_task`, `discard_task_workspace`, 재실행 시 통합 상태 초기화
+- `lib.rs` — 시작 시 작업 공간 스냅샷 복구
+- `src/components/DiffPanel.tsx` (신규), `Tasks.tsx`(격리 체크박스·변경 내역 탭·선행/통합 배지), `PmChat.tsx`, `App.tsx`, `api/index.ts`, `styles.css`
+
+**계획과의 차이**:
+- worktree 위치를 레포 밖으로 변경
+- 결과 취합을 작업별이 아니라 계획 단위로 묶음 (PM 호출 수 절감)
+- 시작 시 남은 변경 스냅샷 복구 추가
+
+**검증**:
+- 단위 테스트 45개 통과 (worktree·스냅샷·충돌 사전 확인·미커밋 겹침 거부·사용자 변경 보존·의존 작업 기준 브랜치·강제 종료 복구·계획 병렬/순서/겹침/격리 불가·묶음 보고·경로 겹침 판정), clippy 경고 0, `pnpm build` 성공
+- 실제 CLI 통합 테스트 6개 통과 (이전 단계 회귀 포함)
+  - 병렬·충돌 격리: 같은 파일을 다르게 고치는 두 작업이 실행 구간이 겹치게 병렬 실행, 실행 중 사용자 레포 무변경, A 병합 후 B는 충돌로 거부되고 레포 무변경
+  - PM 병렬 분할: 독립 2개 작업 → "남은 작업 1개" → 둘 다 끝난 뒤 PM 1회 취합 → 두 결과 병합
+- 실제 앱 실행으로 DB v4 → v5 마이그레이션 확인
+
+**잔존 작업**:
+- worktree는 커밋된 상태에서 시작하므로 사용자 미커밋 변경은 작업자에게 보이지 않음 (UI 안내로 대응)
+- 병합 후 사용자 브랜치 훅(pre-merge-commit 등) 실패 시 병합은 정리되고 오류만 표시
+
 ### 4단계 완료: 2026-11-20
 
 **결과**: 성공

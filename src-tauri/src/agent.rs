@@ -66,6 +66,15 @@ impl Agent {
     pub fn is_pm(&self) -> bool {
         self.kind == KIND_PM
     }
+
+    /// 파일을 바꿀 수 있는 설정인지 (작업 공간 격리 대상 판단)
+    pub fn can_write(&self) -> bool {
+        self.permission_mode != PermissionMode::Plan
+            && self
+                .tools
+                .iter()
+                .any(|t| matches!(t.as_str(), "Edit" | "Write" | "Bash"))
+    }
 }
 
 pub const KIND_PM: &str = "pm";

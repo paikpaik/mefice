@@ -18,17 +18,20 @@ import {
 } from "../api";
 import { StatusBadge } from "../components/StatusBadge";
 import { SourceBadges, UsageNumbers } from "../components/Usage";
+import { DiffPanel, IntegrationBadge } from "../components/DiffPanel";
 
 interface Props {
   onGoTeam: () => void;
   /** 다른 화면에서 특정 작업을 열 때 */
   focusTaskId?: number | null;
+  /** 커밋이 있는 Git 저장소인지 (작업 공간 격리 가능 여부) */
+  canIsolate: boolean;
 }
 
 const MODE_LABEL: Record<string, string> = { pm: "PM 목표", delegated: "위임" };
 
 /** 직접 실행 모드(스펙 4.6) + 작업 목록 + 작업 상세. */
-export function Tasks({ onGoTeam, focusTaskId = null }: Props) {
+export function Tasks({ onGoTeam, focusTaskId = null, canIsolate }: Props) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [selected, setSelected] = useState<number | null>(focusTaskId);
@@ -69,6 +72,7 @@ export function Tasks({ onGoTeam, focusTaskId = null }: Props) {
     <div className="tasks">
       <NewTask
         agents={agents}
+        canIsolate={canIsolate}
         onGoTeam={onGoTeam}
         onCreated={(t) => {
           setTasks((prev) => [t, ...prev]);
@@ -99,7 +103,13 @@ export function Tasks({ onGoTeam, focusTaskId = null }: Props) {
               <div className="row small">
                 <StatusBadge status={t.latestRun?.status} />
                 {MODE_LABEL[t.mode] && <span className="badge">{MODE_LABEL[t.mode]}</span>}
+                <IntegrationBadge task={t} />
                 <span className="muted">{t.agentName}</span>
+                {t.dependsOn.length > 0 && (
+                  <span className="muted" title="선행 작업이 성공해야 시작합니다">
+                    ← {t.dependsOn.map((d) => `#${d}`).join(", ")}
+                  </span>
+                )}
                 {t.latestRun && t.latestRun.attempt > 1 && <span className="muted">#{t.latestRun.attempt}</span>}
               </div>
             </li>
@@ -119,15 +129,18 @@ export function Tasks({ onGoTeam, focusTaskId = null }: Props) {
 
 function NewTask({
   agents,
+  canIsolate,
   onGoTeam,
   onCreated,
 }: {
   agents: Agent[];
+  canIsolate: boolean;
   onGoTeam: () => void;
   onCreated: (t: TaskSummary) => void;
 }) {
   const [agentId, setAgentId] = useState<number | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [isolated, setIsolated] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -151,7 +164,7 @@ function NewTask({
     setBusy(true);
     setError(null);
     try {
-      onCreated(await api.startDirectTask(agentId, prompt));
+      onCreated(await api.startDirectTask(agentId, prompt, isolated && canIsolate));
       setPrompt("");
     } catch (e) {
       setError(errorMessage(e));
@@ -186,6 +199,22 @@ function NewTask({
         <button className="primary" onClick={submit} disabled={busy || !prompt.trim()}>
           실행
         </button>
+        <label
+          className="row small"
+          title={
+            canIsolate
+              ? "사용자 작업 트리와 분리된 git worktree에서 실행하고, 결과는 확인 후 병합합니다. 커밋하지 않은 내 변경은 포함되지 않습니다."
+              : "커밋이 있는 Git 저장소에서만 쓸 수 있습니다."
+          }
+        >
+          <input
+            type="checkbox"
+            checked={isolated && canIsolate}
+            disabled={!canIsolate}
+            onChange={(e) => setIsolated(e.target.checked)}
+          />
+          격리 작업 공간에서 실행
+        </label>
         {error && <span className="error">{error}</span>}
       </div>
     </section>
@@ -198,6 +227,7 @@ function TaskDetailPanel({ taskId }: { taskId: number }) {
   const [events, setEvents] = useState<StoredEvent[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<"log" | "changes">("log");
   const runIdRef = useRef<number | null>(null);
   runIdRef.current = runId;
 
@@ -263,7 +293,9 @@ function TaskDetailPanel({ taskId }: { taskId: number }) {
           <div className="row small muted">
             <span>{detail.agentName}</span>
             {run && <StatusBadge status={run.status} />}
+            <IntegrationBadge task={detail} />
             {run?.config.model && <span className="mono">{run.config.model}</span>}
+            {detail.isolation === "worktree" && <span title={run?.cwd}>격리 작업 공간</span>}
           </div>
         </div>
         {detail.runs.length > 1 && (
@@ -277,7 +309,24 @@ function TaskDetailPanel({ taskId }: { taskId: number }) {
         )}
       </header>
 
-      <Timeline events={events} />
+      {detail.isolation === "worktree" && (
+        <div className="row tabs">
+          <button className={`chip ${view === "log" ? "active" : ""}`} onClick={() => setView("log")}>
+            실행 기록
+          </button>
+          <button className={`chip ${view === "changes" ? "active" : ""}`} onClick={() => setView("changes")}>
+            변경 내역
+          </button>
+        </div>
+      )}
+
+      {view === "changes" && detail.isolation === "worktree" ? (
+        <div className="timeline">
+          <DiffPanel taskId={taskId} onChanged={() => loadDetail(false)} />
+        </div>
+      ) : (
+        <Timeline events={events} />
+      )}
 
       {runId !== null && <RunUsagePanel taskId={taskId} runId={runId} />}
 

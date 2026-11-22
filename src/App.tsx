@@ -71,7 +71,12 @@ export default function App() {
         )}
         {tab === "pm" && <PmChat onOpenTask={openTask} onGoTeam={() => setTab("team")} />}
         {tab === "board" && (
-          <Tasks key={focusTask?.nonce} focusTaskId={focusTask?.id ?? null} onGoTeam={() => setTab("team")} />
+          <Tasks
+            key={focusTask?.nonce}
+            focusTaskId={focusTask?.id ?? null}
+            canIsolate={project.git.isRepo && project.git.head != null}
+            onGoTeam={() => setTab("team")}
+          />
         )}
         {tab === "team" && <Team />}
         {tab === "usage" && <UsageScreen />}

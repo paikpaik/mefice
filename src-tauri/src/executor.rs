@@ -71,15 +71,33 @@ pub struct Executor<R: Runtime = Wry> {
     app: AppHandle<R>,
     active: Mutex<HashMap<i64, mpsc::UnboundedSender<Control>>>,
     pump_lock: Mutex<()>,
+    /// 작업별 worktree 루트 (앱 데이터 폴더 아래, 사용자 레포 밖)
+    worktree_root: PathBuf,
 }
 
 impl<R: Runtime> Executor<R> {
-    pub fn new(app: AppHandle<R>) -> Arc<Self> {
+    pub fn new(app: AppHandle<R>, worktree_root: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             app,
             active: Mutex::new(HashMap::new()),
             pump_lock: Mutex::new(()),
+            worktree_root,
         })
+    }
+
+    /// 블로킹 작업(git 등)을 비동기 런타임 밖에서 DB와 함께 실행한다.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> AppResult<T> + Send + 'static,
+    ) -> AppResult<T> {
+        let app = self.app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let db = app.state::<Db>();
+            let conn = db.inner().conn()?;
+            f(&conn)
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
     }
 
     fn db(&self) -> &Db {
@@ -124,20 +142,45 @@ impl<R: Runtime> Executor<R> {
         let Ok(_guard) = self.pump_lock.lock() else {
             return;
         };
-        let to_start = (|| -> AppResult<Vec<i64>> {
+        // (시작할 Run, 선행 작업 실패로 취소한 Run)
+        let to_start = (|| -> AppResult<(Vec<i64>, Vec<i64>)> {
             let conn = self.db().conn()?;
             let max = settings::load(&conn)?.max_concurrency as i64;
-            let slots = max - task::count_active_runs(&conn)?;
-            if slots <= 0 {
-                return Ok(vec![]);
+            let mut slots = max - task::count_active_runs(&conn)?;
+            let (mut start, mut blocked) = (Vec::new(), Vec::new());
+            for (run_id, task_id) in task::queued_runs(&conn)? {
+                match task::readiness(&conn, task_id)? {
+                    task::Readiness::Ready if slots > 0 => {
+                        // 다른 pump 호출이 같은 Run을 다시 집지 않도록 즉시 running으로 바꾼다
+                        task::set_run_status(&conn, run_id, RunStatus::Running)?;
+                        start.push(run_id);
+                        slots -= 1;
+                    }
+                    task::Readiness::Blocked { dependency } => {
+                        let msg =
+                            format!("선행 작업 #{dependency}이(가) 성공하지 못해 취소했습니다");
+                        task::finish_run(&conn, run_id, RunStatus::Cancelled, None, Some(&msg))?;
+                        let role = task::get_run(&conn, run_id)?.role;
+                        usage::mark_unavailable_if_empty(&conn, run_id, &role)?;
+                        blocked.push(run_id);
+                    }
+                    _ => {}
+                }
             }
-            let ids = task::queued_run_ids(&conn, slots)?;
-            // 다른 pump 호출이 같은 Run을 다시 집지 않도록 즉시 running으로 바꾼다
-            for id in &ids {
-                task::set_run_status(&conn, *id, RunStatus::Running)?;
-            }
-            Ok(ids)
+            Ok((start, blocked))
         })();
+        let to_start = to_start.map(|(start, blocked)| {
+            for run_id in blocked {
+                self.notify_run(run_id);
+                let this = Arc::clone(self);
+                // 계획의 마지막 작업이면 PM 보고가 필요할 수 있다
+                tauri::async_runtime::spawn(async move {
+                    this.after_run_finished(run_id).await;
+                    this.pump();
+                });
+            }
+            start
+        });
 
         match to_start {
             Ok(ids) => {
@@ -182,6 +225,7 @@ impl<R: Runtime> Executor<R> {
             let run = task::get_run(&conn, run_id)?;
             if run.status == RunStatus::Queued {
                 task::finish_run(&conn, run_id, RunStatus::Cancelled, None, None)?;
+                usage::mark_unavailable_if_empty(&conn, run_id, &run.role)?;
             }
             run
         };
@@ -193,6 +237,11 @@ impl<R: Runtime> Executor<R> {
                 },
             );
             self.notify_run(run_id);
+            let this = Arc::clone(self);
+            tauri::async_runtime::spawn(async move {
+                this.after_run_finished(run_id).await;
+                this.pump();
+            });
             Ok(())
         } else if run.status.is_terminal() {
             Err(AppError::InvalidInput("이미 끝난 실행입니다".into()))
@@ -263,6 +312,25 @@ impl<R: Runtime> Executor<R> {
                 let _ = usage::mark_unavailable_if_empty(&conn, run_id, &run.role);
                 let _ = self.app.emit(EVENT_USAGE_UPDATED, run.task_id);
             }
+        }
+        // 격리 작업이면 변경을 Mefice 브랜치에 고정 (diff·병합·PM 보고의 기준)
+        let snap = self
+            .blocking(move |c| {
+                let run = task::get_run(c, run_id)?;
+                let t = task::get_task(c, run.task_id)?;
+                if t.isolation == task::ISOLATION_WORKTREE {
+                    crate::workspace::snapshot(c, &t, run.attempt)?;
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(e) = snap {
+            self.record(
+                run_id,
+                RunEvent::Notice {
+                    text: format!("변경 기록(스냅샷) 실패: {e}"),
+                },
+            );
         }
         self.notify_run(run_id);
         self.after_run_finished(run_id).await;
@@ -362,9 +430,34 @@ impl<R: Runtime> Executor<R> {
         let Some(bin) = resolve_binary("claude") else {
             return Outcome::failed("claude CLI를 찾을 수 없습니다. 설정 > 실행 환경을 확인하세요");
         };
-        let cwd = PathBuf::from(&run.cwd);
+        let mut config = run.config.clone();
+        let task_id = run.task_id;
+        let root = self.worktree_root.clone();
+        let isolated = self
+            .blocking(move |c| {
+                let t = task::get_task(c, task_id)?;
+                if t.isolation != task::ISOLATION_WORKTREE {
+                    return Ok(None);
+                }
+                let path = crate::workspace::prepare(c, &root, &t)?;
+                task::set_run_cwd(c, run_id, &path.to_string_lossy())?;
+                Ok(Some(path))
+            })
+            .await;
+        let cwd = match isolated {
+            Ok(Some(path)) => {
+                config.system_append.push_str(
+                    "\n\n## 작업 공간\n이 작업은 사용자 저장소와 분리된 git worktree에서 실행됩니다. \
+                     변경 사항은 Mefice가 기록하고 사용자가 검토 후 병합하므로 git commit·push·브랜치 변경을 하지 마세요.",
+                );
+                self.notify_run(run_id);
+                path
+            }
+            Ok(None) => PathBuf::from(&run.cwd),
+            Err(e) => return Outcome::failed(format!("작업 공간 준비 실패: {e}")),
+        };
         if !cwd.is_dir() {
-            return Outcome::failed(format!("작업 폴더가 없습니다: {}", run.cwd));
+            return Outcome::failed(format!("작업 폴더가 없습니다: {}", cwd.display()));
         }
 
         let new_session_id = uuid::Uuid::new_v4().to_string();
@@ -372,7 +465,7 @@ impl<R: Runtime> Executor<R> {
             Some(prev) => (Session::Resume(prev), prev.clone()),
             None => (Session::New(&new_session_id), new_session_id.clone()),
         };
-        let mut cmd = claude_code::build_command(&bin, &cwd, &run.config, session);
+        let mut cmd = claude_code::build_command(&bin, &cwd, &config, session);
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -624,7 +717,7 @@ mod live_tests {
         let proj = tempfile::tempdir().unwrap();
         app.manage(Db::open(&data.path().join("t.db")).unwrap());
         let handle = app.handle().clone();
-        let exec = Executor::new(handle.clone());
+        let exec = Executor::new(handle.clone(), data.path().join("worktrees"));
 
         let agent_id = {
             let conn = handle.state::<Db>().inner().conn().unwrap();
@@ -982,6 +1075,185 @@ mod live_tests {
             assert_eq!(
                 pm_runs[1].resume_session_id, pm_runs[0].session_id,
                 "취합은 같은 PM 세션을 이어서"
+            );
+        });
+    }
+
+    /// 프로젝트 폴더를 커밋 하나가 있는 Git 저장소로 만든다.
+    fn make_git_repo(env: &Env) {
+        let p = env.proj.path();
+        crate::git::run(p, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(p.join("a.txt"), "original\n").unwrap();
+        crate::git::snapshot_commit(p, "init").unwrap();
+    }
+
+    fn start_isolated(env: &Env, agent_id: i64, prompt: &str) -> (i64, i64) {
+        let conn = env.handle.state::<Db>().inner().conn().unwrap();
+        let pid = settings::current_project_id(&conn).unwrap().unwrap();
+        let p = project::get(&conn, pid).unwrap().unwrap();
+        let a = agent::get(&conn, agent_id).unwrap();
+        let t = task::create_task(&conn, p.id, a.id, prompt).unwrap();
+        task::set_isolation(&conn, t.id, task::ISOLATION_WORKTREE).unwrap();
+        let r = task::create_run(
+            &conn,
+            task::NewRun {
+                task_id: t.id,
+                agent_id: a.id,
+                prompt,
+                resume_session_id: None,
+                config: &crate::pm::run_config(&p, &a),
+                cwd: &p.path,
+            },
+        )
+        .unwrap();
+        (t.id, r.id)
+    }
+
+    /// 5단계 완료 기준: 독립적인 두 작업을 병렬 실행하고 파일 충돌을 격리한다.
+    #[test]
+    #[ignore]
+    fn live_병렬_실행과_충돌_격리() {
+        let (env, agent_id) = setup(PermissionMode::AcceptEdits);
+        make_git_repo(&env);
+        let repo = env.proj.path().to_path_buf();
+        tauri::async_runtime::block_on(async {
+            let (ta, ra) = start_isolated(
+                &env,
+                agent_id,
+                "Write 도구로 a.txt의 내용을 AAA 한 줄로 바꿔. 다른 일은 하지 마.",
+            );
+            let (tb, rb) = start_isolated(
+                &env,
+                agent_id,
+                "Write 도구로 a.txt의 내용을 BBB 한 줄로 바꿔. 다른 일은 하지 마.",
+            );
+            env.exec.pump(); // 동시 실행 상한 기본값 2
+
+            let a = wait_until(&env, ra, 120, |r| r.status.is_terminal()).await;
+            let b = wait_until(&env, rb, 120, |r| r.status.is_terminal()).await;
+            assert_eq!(a.status, RunStatus::Succeeded, "{:?}", a.error);
+            assert_eq!(b.status, RunStatus::Succeeded, "{:?}", b.error);
+            let overlap = a.started_at.unwrap() < b.ended_at.unwrap()
+                && b.started_at.unwrap() < a.ended_at.unwrap();
+            println!(
+                "A {:?}~{:?} / B {:?}~{:?} → 병렬: {overlap}",
+                a.started_at, a.ended_at, b.started_at, b.ended_at
+            );
+            assert!(overlap, "두 작업의 실행 구간이 겹쳐야 함");
+            assert_ne!(a.cwd, b.cwd, "작업마다 다른 작업 공간");
+            assert_eq!(
+                std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+                "original\n",
+                "실행 중 사용자 레포는 그대로"
+            );
+
+            let conn = env.handle.state::<Db>().inner().conn().unwrap();
+            let da = crate::workspace::diff(&conn, ta).unwrap();
+            let db_ = crate::workspace::diff(&conn, tb).unwrap();
+            println!("A 변경: {:?} / B 변경: {:?}", da.files, db_.files);
+            assert!(
+                da.can_merge && db_.can_merge,
+                "병합 전에는 둘 다 각각 병합 가능"
+            );
+
+            crate::workspace::merge(&conn, ta).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(repo.join("a.txt")).unwrap().trim(),
+                "AAA"
+            );
+
+            let db2 = crate::workspace::diff(&conn, tb).unwrap();
+            assert_eq!(db2.conflicts, vec!["a.txt"], "A 병합 후 B는 충돌로 표시");
+            assert!(crate::workspace::merge(&conn, tb).is_err());
+            assert_eq!(
+                std::fs::read_to_string(repo.join("a.txt")).unwrap().trim(),
+                "AAA",
+                "충돌 시 레포 변경 없음"
+            );
+            assert!(crate::git::dirty_files(&repo).unwrap().is_empty());
+            crate::workspace::discard(&conn, tb).unwrap();
+        });
+    }
+
+    /// PM이 독립 작업 두 개로 나눠 위임하고, 둘 다 끝난 뒤 한 번만 취합한다.
+    #[test]
+    #[ignore]
+    fn live_pm_병렬_분할과_묶음_보고() {
+        let (env, _worker) = setup(PermissionMode::AcceptEdits);
+        make_git_repo(&env);
+        tauri::async_runtime::block_on(async {
+            let goal_id = {
+                let conn = env.handle.state::<Db>().inner().conn().unwrap();
+                let pm = agent::ensure_pm(&conn).unwrap();
+                conn.execute("UPDATE agents SET model = 'haiku' WHERE id = ?1", [pm.id])
+                    .unwrap();
+                let pid = settings::current_project_id(&conn).unwrap().unwrap();
+                let p = project::get(&conn, pid).unwrap().unwrap();
+                pm::start_goal(
+                    &conn,
+                    &p,
+                    "x.txt(내용 x)와 y.txt(내용 y)를 만드는 일을 서로 독립된 두 작업으로 나눠 팀원에게 동시에 위임해. 직접 하지 마.",
+                )
+                .unwrap()
+                .0
+                .id
+            };
+            env.exec.pump();
+
+            let deadline = Instant::now() + Duration::from_secs(300);
+            loop {
+                let msgs = {
+                    let conn = env.handle.state::<Db>().inner().conn().unwrap();
+                    pm::list_messages(&conn, goal_id).unwrap()
+                };
+                if msgs.iter().any(|m| {
+                    m.author == "pm" && m.payload.as_ref().is_some_and(|p| p["mode"] == "report")
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "시간 초과: {:#?}",
+                    msgs.iter()
+                        .map(|m| (&m.author, &m.text))
+                        .collect::<Vec<_>>()
+                );
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let last_pm = {
+                let conn = env.handle.state::<Db>().inner().conn().unwrap();
+                task::latest_run(&conn, goal_id).unwrap().unwrap().id
+            };
+            wait_until(&env, last_pm, 60, |r| r.status.is_terminal()).await;
+
+            let conn = env.handle.state::<Db>().inner().conn().unwrap();
+            for m in pm::list_messages(&conn, goal_id).unwrap() {
+                println!("[{}] {}", m.author, m.text.replace('\n', " / "));
+            }
+            let kids = task::list_children(&conn, goal_id).unwrap();
+            assert_eq!(kids.len(), 2, "두 작업으로 분할");
+            assert!(kids.iter().all(|k| k.isolation == task::ISOLATION_WORKTREE));
+            assert!(
+                kids.iter()
+                    .all(|k| task::dependencies(&conn, k.id).unwrap().is_empty()),
+                "독립 작업"
+            );
+            let pm_runs = task::list_runs(&conn, goal_id).unwrap();
+            assert_eq!(pm_runs.len(), 2, "계획 1회 + 묶음 취합 1회");
+            for k in &kids {
+                let d = crate::workspace::diff(&conn, k.id).unwrap();
+                println!(
+                    "작업 #{} 변경: {:?}",
+                    k.id,
+                    d.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+                );
+                assert!(d.can_merge);
+                crate::workspace::merge(&conn, k.id).unwrap();
+            }
+            let repo = env.proj.path();
+            assert!(
+                repo.join("x.txt").exists() && repo.join("y.txt").exists(),
+                "두 결과 모두 병합"
             );
         });
     }

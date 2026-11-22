@@ -16,6 +16,7 @@ import {
   type UsageGroup,
 } from "../api";
 import { StatusBadge } from "../components/StatusBadge";
+import { IntegrationBadge } from "../components/DiffPanel";
 import { fmtCost, fmtTokens } from "../components/Usage";
 
 const MODE_LABEL: Record<PmMode, string> = {
@@ -294,10 +295,18 @@ function HireCard({ hire }: { hire: NonNullable<PmDecision["hire"]> }) {
 function ChildCard({ task, onOpen }: { task: TaskSummary; onOpen: () => void }) {
   return (
     <div className="child" onClick={onOpen}>
-      <span className="muted small">위임</span>
-      <span className="task-title">{task.title}</span>
+      <span className="muted small">#{task.id}</span>
+      <span className="task-title">
+        {task.title}
+        {task.dependsOn.length > 0 && (
+          <span className="muted small"> ← {task.dependsOn.map((d) => `#${d}`).join(", ")}</span>
+        )}
+      </span>
       <span className="muted small">{task.agentName}</span>
-      <StatusBadge status={task.latestRun?.status} />
+      <span className="row">
+        <StatusBadge status={task.latestRun?.status} />
+        <IntegrationBadge task={task} />
+      </span>
     </div>
   );
 }

@@ -18,6 +18,7 @@ use crate::runtime::RateLimitSnapshot;
 use crate::settings::{self, AppSettings};
 use crate::task::{self, Approval, Run, StoredEvent, Task, TaskSummary};
 use crate::usage;
+use crate::workspace;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -137,10 +138,12 @@ fn current_project(conn: &Connection) -> AppResult<Project> {
 fn summary(conn: &Connection, task: Task) -> AppResult<TaskSummary> {
     let agent_name = agent::get(conn, task.agent_id)?.name;
     let latest_run = task::latest_run(conn, task.id)?;
+    let depends_on = task::dependencies(conn, task.id)?;
     Ok(TaskSummary {
         task,
         agent_name,
         latest_run,
+        depends_on,
     })
 }
 
@@ -151,6 +154,7 @@ pub async fn start_direct_task(
     executor: State<'_, Arc<Executor>>,
     agent_id: i64,
     prompt: String,
+    isolated: Option<bool>,
 ) -> AppResult<TaskSummary> {
     let result = {
         let conn = db.conn()?;
@@ -162,6 +166,12 @@ pub async fn start_direct_task(
             ));
         }
         let task = task::create_task(&conn, project.id, agent.id, &prompt)?;
+        // 기본값: 파일을 바꿀 수 있는 에이전트이고 Git 격리가 가능하면 worktree에서 실행
+        let want = isolated.unwrap_or(true) && agent.can_write();
+        if want && crate::git::can_isolate(std::path::Path::new(&project.path)) {
+            task::set_isolation(&conn, task.id, task::ISOLATION_WORKTREE)?;
+        }
+        let task = task::get_task(&conn, task.id)?;
         task::create_run(
             &conn,
             task::NewRun {
@@ -215,6 +225,10 @@ fn new_run_for_task(db: &Db, task_id: i64, follow_up: Option<String>) -> AppResu
         return Err(AppError::InvalidInput(
             "이 작업은 아직 실행 중입니다".into(),
         ));
+    }
+    // 병합·폐기 후 다시 실행하면 새 결과가 생기므로 통합 상태를 되돌린다
+    if task.integration != "none" {
+        task::set_integration(&conn, task_id, "none")?;
     }
     let (prompt, resume) = match &follow_up {
         Some(p) => {
@@ -430,4 +444,38 @@ pub async fn pm_send(
         pm::Delivery::SendTo { run_id, prompt } => executor.send_message(run_id, prompt).await?,
     }
     Ok(goal_id)
+}
+
+// ---------- 작업 공간 · 통합 (5단계) ----------
+
+/// git 등 블로킹 작업을 DB와 함께 별도 스레드에서 실행
+async fn with_db_blocking<T: Send + 'static>(
+    app: tauri::AppHandle,
+    f: impl FnOnce(&Connection) -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    use tauri::Manager;
+    blocking(move || {
+        let db = app.state::<Db>();
+        let conn = db.inner().conn()?;
+        f(&conn)
+    })
+    .await?
+}
+
+/// 변경 내역과 병합 가능 여부 (충돌·미커밋 겹침 사전 확인 포함, 작업 트리 변경 없음)
+#[tauri::command]
+pub async fn get_task_diff(app: tauri::AppHandle, task_id: i64) -> AppResult<workspace::TaskDiff> {
+    with_db_blocking(app, move |c| workspace::diff(c, task_id)).await
+}
+
+/// 사용자 현재 브랜치에 병합 (사용자 확정 시에만 호출)
+#[tauri::command]
+pub async fn merge_task(app: tauri::AppHandle, task_id: i64) -> AppResult<String> {
+    with_db_blocking(app, move |c| workspace::merge(c, task_id)).await
+}
+
+/// 작업 결과를 버리고 작업 공간을 정리
+#[tauri::command]
+pub async fn discard_task_workspace(app: tauri::AppHandle, task_id: i64) -> AppResult<()> {
+    with_db_blocking(app, move |c| workspace::discard(c, task_id)).await
 }

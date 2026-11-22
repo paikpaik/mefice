@@ -147,6 +147,34 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX idx_messages_goal ON messages(goal_task_id, id);
     "#,
+    // v5: 의존성 · 병렬 실행 · worktree (5단계)
+    r#"
+    -- worktree: 작업별 Git worktree에서 실행 / none: 프로젝트 폴더에서 실행
+    ALTER TABLE tasks ADD COLUMN isolation TEXT NOT NULL DEFAULT 'none';
+    -- 같은 PM 결정(계획)에서 나온 작업 묶음. 모두 끝나면 PM에게 한 번에 보고
+    ALTER TABLE tasks ADD COLUMN plan_run_id INTEGER REFERENCES runs(id);
+    -- 사용자 통합 상태: none | merged | discarded (모델 실행 완료와 구분, 스펙 9장)
+    ALTER TABLE tasks ADD COLUMN integration TEXT NOT NULL DEFAULT 'none';
+
+    CREATE TABLE task_dependencies (
+        task_id    INTEGER NOT NULL REFERENCES tasks(id),
+        depends_on INTEGER NOT NULL REFERENCES tasks(id),
+        reason     TEXT,  -- planned(PM 지정) | overlap(경로 겹침) | no_isolation(격리 불가)
+        PRIMARY KEY (task_id, depends_on)
+    );
+
+    CREATE TABLE workspaces (
+        task_id      INTEGER PRIMARY KEY REFERENCES tasks(id),
+        path         TEXT    NOT NULL,
+        branch       TEXT    NOT NULL,
+        base_commit  TEXT    NOT NULL,
+        base_ref     TEXT,            -- 생성 시점 사용자 브랜치 또는 선행 작업 브랜치
+        head_commit  TEXT,            -- 마지막 스냅샷 커밋
+        merged_commit TEXT,
+        created_at   INTEGER NOT NULL,
+        removed_at   INTEGER
+    );
+    "#,
 ];
 
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {

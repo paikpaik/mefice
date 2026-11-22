@@ -4,6 +4,7 @@ mod db;
 mod env_check;
 mod error;
 mod executor;
+mod git;
 mod pm;
 mod project;
 mod runtime;
@@ -11,15 +12,19 @@ mod settings;
 mod sysproc;
 mod task;
 mod usage;
+mod workspace;
 
 use tauri::Manager;
 
 /// 앱 시작 시 복구 (스펙 9장).
 /// - 이전 실행에서 끝나지 않은 Run은 실제 상태를 확인할 수 없으므로 interrupted로 표시한다 (자동 재실행 안 함).
 /// - 종료 처리를 못 한 Run의 사용량은 "미제공"으로 남긴다.
+/// - 격리 작업 공간에 남은 변경은 스냅샷으로 고정한다 (자동 재실행·병합은 하지 않음).
 fn recover_on_startup(conn: &rusqlite::Connection) -> error::AppResult<()> {
     task::interrupt_unfinished_runs(conn)?;
     usage::backfill_unavailable(conn)?;
+    // 실행 중 종료된 격리 작업의 남은 변경을 고정해 변경 내역에서 확인할 수 있게 한다 (모델 호출 없음)
+    workspace::snapshot_all(conn)?;
     Ok(())
 }
 
@@ -33,7 +38,10 @@ pub fn run() {
             let db = db::Db::open(&data_dir.join("mefice.db"))?;
             recover_on_startup(&*db.conn()?)?;
             app.manage(db);
-            app.manage(executor::Executor::new(app.handle().clone()));
+            app.manage(executor::Executor::new(
+                app.handle().clone(),
+                data_dir.join("worktrees"),
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -63,6 +71,9 @@ pub fn run() {
             commands::list_goals,
             commands::get_goal,
             commands::pm_send,
+            commands::get_task_diff,
+            commands::merge_task,
+            commands::discard_task_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("Mefice 실행 중 오류가 발생했습니다");

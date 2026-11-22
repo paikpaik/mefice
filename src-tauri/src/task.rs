@@ -77,6 +77,12 @@ pub struct Task {
     pub mode: String,
     /// 위임 명세 (목표·범위·입력·완료 조건)
     pub spec: Option<Value>,
+    /// worktree(작업별 Git worktree) | none(프로젝트 폴더)
+    pub isolation: String,
+    /// 같은 PM 결정에서 나온 작업 묶음 (PM Run id)
+    pub plan_run_id: Option<i64>,
+    /// 사용자 통합 상태: none | merged | discarded
+    pub integration: String,
     pub title: String,
     pub prompt: String,
     pub created_at: i64,
@@ -113,6 +119,8 @@ pub struct TaskSummary {
     pub task: Task,
     pub agent_name: String,
     pub latest_run: Option<Run>,
+    /// 선행 작업 id
+    pub depends_on: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +160,9 @@ fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
         spec: r
             .get::<_, Option<String>>("spec")?
             .and_then(|s| serde_json::from_str(&s).ok()),
+        isolation: r.get("isolation")?,
+        plan_run_id: r.get("plan_run_id")?,
+        integration: r.get("integration")?,
         title: r.get("title")?,
         prompt: r.get("prompt")?,
         created_at: r.get("created_at")?,
@@ -268,6 +279,108 @@ fn insert_task(
     get_task(conn, conn.last_insert_rowid())
 }
 
+pub const ISOLATION_WORKTREE: &str = "worktree";
+pub const ISOLATION_NONE: &str = "none";
+
+pub fn set_isolation(conn: &Connection, task_id: i64, isolation: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE tasks SET isolation = ?1 WHERE id = ?2",
+        params![isolation, task_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_plan_run(conn: &Connection, task_id: i64, plan_run_id: i64) -> AppResult<()> {
+    conn.execute(
+        "UPDATE tasks SET plan_run_id = ?1 WHERE id = ?2",
+        params![plan_run_id, task_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_integration(conn: &Connection, task_id: i64, integration: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE tasks SET integration = ?1 WHERE id = ?2",
+        params![integration, task_id],
+    )?;
+    Ok(())
+}
+
+/// 같은 PM 결정에서 나온 작업들
+pub fn plan_tasks(conn: &Connection, plan_run_id: i64) -> AppResult<Vec<Task>> {
+    let mut stmt = conn.prepare("SELECT * FROM tasks WHERE plan_run_id = ?1 ORDER BY id")?;
+    let rows = stmt.query_map([plan_run_id], task_from_row)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+// ---------- 의존성 ----------
+
+pub const DEP_PLANNED: &str = "planned";
+pub const DEP_OVERLAP: &str = "overlap";
+pub const DEP_NO_ISOLATION: &str = "no_isolation";
+
+pub fn add_dependency(
+    conn: &Connection,
+    task_id: i64,
+    depends_on: i64,
+    reason: &str,
+) -> AppResult<()> {
+    if task_id == depends_on {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on, reason) VALUES (?1, ?2, ?3)",
+        params![task_id, depends_on, reason],
+    )?;
+    Ok(())
+}
+
+pub fn dependencies(conn: &Connection, task_id: i64) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT depends_on FROM task_dependencies WHERE task_id = ?1 ORDER BY depends_on",
+    )?;
+    let rows = stmt.query_map([task_id], |r| r.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// `from`에서 의존성을 따라가 `to`에 닿는지 (순환·중복 의존 방지용)
+pub fn depends_transitively(conn: &Connection, from: i64, to: i64) -> AppResult<bool> {
+    let mut stack = vec![from];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(t) = stack.pop() {
+        if t == to {
+            return Ok(true);
+        }
+        if seen.insert(t) {
+            stack.extend(dependencies(conn, t)?);
+        }
+    }
+    Ok(false)
+}
+
+/// 큐에 있는 Run이 시작될 수 있는지
+#[derive(Debug, PartialEq)]
+pub enum Readiness {
+    Ready,
+    /// 선행 작업이 아직 끝나지 않음
+    Waiting,
+    /// 선행 작업이 성공하지 못함 → 이 Run은 취소
+    Blocked {
+        dependency: i64,
+    },
+}
+
+pub fn readiness(conn: &Connection, task_id: i64) -> AppResult<Readiness> {
+    for dep in dependencies(conn, task_id)? {
+        match latest_run(conn, dep)?.map(|r| r.status) {
+            Some(RunStatus::Succeeded) => {}
+            Some(s) if s.is_terminal() => return Ok(Readiness::Blocked { dependency: dep }),
+            _ => return Ok(Readiness::Waiting),
+        }
+    }
+    Ok(Readiness::Ready)
+}
+
 pub fn get_task(conn: &Connection, id: i64) -> AppResult<Task> {
     conn.query_row("SELECT * FROM tasks WHERE id = ?1", [id], task_from_row)
         .optional()?
@@ -287,7 +400,9 @@ pub fn list_tasks(conn: &Connection, project_id: i64) -> AppResult<Vec<TaskSumma
     rows.into_iter()
         .map(|(task, agent_name)| {
             let latest_run = latest_run(conn, task.id)?;
+            let depends_on = dependencies(conn, task.id)?;
             Ok(TaskSummary {
+                depends_on,
                 task,
                 agent_name,
                 latest_run,
@@ -425,10 +540,11 @@ pub fn count_active_runs(conn: &Connection) -> AppResult<i64> {
     )?)
 }
 
-pub fn queued_run_ids(conn: &Connection, limit: i64) -> AppResult<Vec<i64>> {
+/// 큐에 있는 Run (생성 순서). 시작 가능 여부는 `readiness`로 판단한다.
+pub fn queued_runs(conn: &Connection) -> AppResult<Vec<(i64, i64)>> {
     let mut stmt =
-        conn.prepare("SELECT id FROM runs WHERE status = 'queued' ORDER BY id LIMIT ?1")?;
-    let rows = stmt.query_map([limit], |r| r.get(0))?;
+        conn.prepare("SELECT id, task_id FROM runs WHERE status = 'queued' ORDER BY id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -445,6 +561,11 @@ pub fn mark_run_started(conn: &Connection, id: i64, session_id: &str) -> AppResu
         "UPDATE runs SET status = 'running', session_id = ?1, started_at = ?2 WHERE id = ?3",
         params![session_id, now_ms(), id],
     )?;
+    Ok(())
+}
+
+pub fn set_run_cwd(conn: &Connection, id: i64, cwd: &str) -> AppResult<()> {
+    conn.execute("UPDATE runs SET cwd = ?1 WHERE id = ?2", params![cwd, id])?;
     Ok(())
 }
 
@@ -680,7 +801,12 @@ mod tests {
         let r2 = create_run(&conn, new("b")).unwrap();
         assert_eq!((r1.attempt, r2.attempt), (1, 2));
         assert_eq!(latest_run(&conn, t.id).unwrap().unwrap().id, r2.id);
-        assert_eq!(queued_run_ids(&conn, 10).unwrap(), vec![r1.id, r2.id]);
+        let queued: Vec<i64> = queued_runs(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(queued, vec![r1.id, r2.id]);
     }
 
     #[test]

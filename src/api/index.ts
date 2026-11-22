@@ -137,6 +137,12 @@ export interface Task {
   /** direct | pm | delegated */
   mode: "direct" | "pm" | "delegated";
   spec: DelegateSpec | null;
+  /** worktree: 작업별 Git worktree에서 실행 / none: 프로젝트 폴더 */
+  isolation: "worktree" | "none";
+  /** 같은 PM 결정에서 나온 작업 묶음 */
+  planRunId: number | null;
+  /** 사용자 통합 상태 (모델 실행 완료와 별개) */
+  integration: "none" | "merged" | "discarded";
   title: string;
   prompt: string;
   createdAt: number;
@@ -145,7 +151,10 @@ export interface Task {
 // ---------- PM (4단계) ----------
 
 export interface DelegateSpec {
+  key: string;
   agentId: number;
+  paths: string[];
+  dependsOn: string[];
   title: string;
   goal: string;
   scope: string;
@@ -194,6 +203,8 @@ export interface GoalDetail extends TaskSummary {
 export interface TaskSummary extends Task {
   agentName: string;
   latestRun: Run | null;
+  /** 선행 작업 id */
+  dependsOn: number[];
 }
 
 export interface TaskDetail extends TaskSummary {
@@ -215,6 +226,43 @@ export interface SessionTotals {
   cacheCreationTokens: number;
   costUsd: number | null;
   models: string[];
+}
+
+// ---------- 작업 공간 · 통합 (5단계) ----------
+
+export interface FileChange {
+  path: string;
+  /** A 추가 / M 수정 / D 삭제 */
+  status: string;
+  additions: number | null;
+  deletions: number | null;
+}
+
+export interface Workspace {
+  taskId: number;
+  path: string;
+  branch: string;
+  baseCommit: string;
+  baseRef: string | null;
+  headCommit: string | null;
+  mergedCommit: string | null;
+  createdAt: number;
+  removedAt: number | null;
+}
+
+export interface TaskDiff {
+  available: boolean;
+  reason: string | null;
+  integration: Task["integration"];
+  workspace: Workspace | null;
+  files: FileChange[];
+  patch: string;
+  truncated: boolean;
+  /** 사용자 현재 HEAD와 병합 시 충돌할 파일 */
+  conflicts: string[];
+  /** 사용자 미커밋 변경과 겹치는 파일 */
+  dirtyOverlap: string[];
+  canMerge: boolean;
 }
 
 // ---------- 사용량 (3단계) ----------
@@ -330,8 +378,8 @@ export const api = {
   updateAgent: (id: number, input: AgentInput) => invoke<Agent>("update_agent", { id, input }),
   archiveAgent: (id: number) => invoke<void>("archive_agent", { id }),
 
-  startDirectTask: (agentId: number, prompt: string) =>
-    invoke<TaskSummary>("start_direct_task", { agentId, prompt }),
+  startDirectTask: (agentId: number, prompt: string, isolated: boolean) =>
+    invoke<TaskSummary>("start_direct_task", { agentId, prompt, isolated }),
   rerunTask: (taskId: number) => invoke<Run>("rerun_task", { taskId }),
   continueTask: (taskId: number, prompt: string) => invoke<Run>("continue_task", { taskId, prompt }),
   listTasks: () => invoke<TaskSummary[]>("list_tasks"),
@@ -351,6 +399,11 @@ export const api = {
   getGoal: (goalId: number) => invoke<GoalDetail>("get_goal", { goalId }),
   /** goalId가 null이면 새 목표. 반환값은 목표 id */
   pmSend: (goalId: number | null, text: string) => invoke<number>("pm_send", { goalId, text }),
+
+  getTaskDiff: (taskId: number) => invoke<TaskDiff>("get_task_diff", { taskId }),
+  /** 사용자 현재 브랜치에 병합. 반환값은 병합 커밋 */
+  mergeTask: (taskId: number) => invoke<string>("merge_task", { taskId }),
+  discardTaskWorkspace: (taskId: number) => invoke<void>("discard_task_workspace", { taskId }),
 };
 
 /** Rust AppError는 문자열로 직렬화되어 온다. */
