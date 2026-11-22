@@ -610,6 +610,26 @@ pub fn finish_run(
     Ok(())
 }
 
+/// 앱 시작 시: 끝나지 않았던 Run 중 기록된 런타임 프로세스가 아직 살아 있는 것을 찾는다.
+/// 앱이 강제 종료되면 자식 프로세스가 고아로 남아 계속 실행될 수 있다 (실측 확인).
+/// pid가 다른 프로그램에 재사용됐을 수 있으므로 명령줄에 세션 id가 있을 때만 대상으로 본다.
+pub fn orphaned_runtimes(conn: &Connection) -> AppResult<Vec<(i64, u32)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, pid, session_id FROM runs WHERE pid IS NOT NULL AND status IN ({NON_TERMINAL_STATUSES})"
+    ))?;
+    let rows: Vec<(i64, i64, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, pid, session)| {
+            let pid = u32::try_from(pid).ok()?;
+            let cmd = crate::sysproc::process_command(pid)?;
+            (session.is_some_and(|s| cmd.contains(&s))).then_some((id, pid))
+        })
+        .collect())
+}
+
 /// 앱 시작 시: 이전 프로세스는 앱과 함께 종료되었으므로 끝나지 않은 Run을 interrupted로 표시한다.
 /// 확인되지 않는 실행을 진행 중으로 표시하지 않고, 자동 재실행도 하지 않는다 (스펙 4.4, 9장).
 pub fn interrupt_unfinished_runs(conn: &Connection) -> AppResult<usize> {

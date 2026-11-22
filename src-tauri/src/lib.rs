@@ -1,10 +1,13 @@
 mod agent;
+#[cfg(test)]
+mod bench;
 mod commands;
 mod db;
 mod env_check;
 mod error;
 mod executor;
 mod git;
+mod lifecycle;
 mod office;
 mod pm;
 mod project;
@@ -19,10 +22,22 @@ mod workspace;
 use tauri::Manager;
 
 /// 앱 시작 시 복구 (스펙 9장).
+/// - 강제 종료로 고아가 된 런타임 프로세스(세션 id로 확인)를 종료한다.
 /// - 이전 실행에서 끝나지 않은 Run은 실제 상태를 확인할 수 없으므로 interrupted로 표시한다 (자동 재실행 안 함).
 /// - 종료 처리를 못 한 Run의 사용량은 "미제공"으로 남긴다.
 /// - 격리 작업 공간에 남은 변경은 스냅샷으로 고정한다 (자동 재실행·병합은 하지 않음).
-fn recover_on_startup(conn: &rusqlite::Connection) -> error::AppResult<()> {
+pub(crate) fn recover_on_startup(conn: &rusqlite::Connection) -> error::AppResult<()> {
+    // 강제 종료로 남은 런타임(과 도구 명령)을 먼저 끈다. 계속 돌면 파일을 고치고 사용량을 쓴다.
+    for (run_id, pid) in task::orphaned_runtimes(conn)? {
+        sysproc::terminate_tree(pid, std::time::Duration::from_secs(3));
+        task::append_event(
+            conn,
+            run_id,
+            &runtime::RunEvent::Notice {
+                text: format!("앱 재시작 시 남아 있던 런타임 프로세스(pid {pid})를 종료했습니다"),
+            },
+        )?;
+    }
     task::interrupt_unfinished_runs(conn)?;
     usage::backfill_unavailable(conn)?;
     // 실행 중 종료된 격리 작업의 남은 변경을 고정해 변경 내역에서 확인할 수 있게 한다 (모델 호출 없음)
@@ -44,8 +59,11 @@ pub fn run() {
                 app.handle().clone(),
                 data_dir.join("worktrees"),
             ));
+            app.manage(lifecycle::QuitGate::default());
+            lifecycle::setup_tray(app)?;
             Ok(())
         })
+        .on_window_event(lifecycle::on_window_event)
         .invoke_handler(tauri::generate_handler![
             commands::get_app_state,
             commands::open_project,
@@ -79,15 +97,19 @@ pub fn run() {
             commands::list_templates,
             commands::get_office_state,
             commands::get_agent_overview,
+            commands::get_active_runs,
+            commands::confirm_quit,
+            commands::keep_running_in_background,
         ])
-        .run(tauri::generate_context!())
-        .expect("Mefice 실행 중 오류가 발생했습니다");
+        .build(tauri::generate_context!())
+        .expect("Mefice 실행 중 오류가 발생했습니다")
+        .run(lifecycle::on_run_event);
 }
 
 #[cfg(test)]
 mod restore_tests {
     use super::recover_on_startup;
-    use crate::{db::Db, project, settings, task, usage};
+    use crate::{db::Db, project, settings, sysproc, task, usage};
 
     /// 1단계 완료 기준: 앱 재실행(= DB 파일을 닫고 다시 열기) 후 설정·프로젝트·지침이 복원된다.
     #[test]
@@ -256,5 +278,106 @@ mod restore_tests {
                 .unavailable,
             1
         );
+    }
+
+    /// 7단계: 앱이 강제 종료되어 고아가 된 런타임(과 도구 명령)을 재시작 시 정리한다.
+    /// 세션 id가 명령줄에 없는 프로세스(pid 재사용)는 건드리지 않는다.
+    #[test]
+    fn 재시작시_고아_런타임_프로세스_정리() {
+        use crate::agent::{self, AgentInput, PermissionMode};
+        use crate::runtime::RunConfig;
+        use crate::task::RunStatus;
+        use std::os::unix::process::CommandExt;
+
+        // 런타임 흉내: 세션 id가 명령줄에 있고, 도구 명령(sleep)을 자식으로 둔 프로세스 그룹
+        let spawn = |marker: &str| {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("sleep 60 & sleep 60; true # {marker}")])
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        let mut orphan = spawn("sess-orphan");
+        let mut stranger = spawn("다른-프로그램");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.conn().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = project::upsert(&conn, dir.path()).unwrap();
+        let a = agent::create(
+            &conn,
+            &AgentInput {
+                name: "a".into(),
+                role: "r".into(),
+                instructions: String::new(),
+                model: None,
+                effort: None,
+                permission_mode: PermissionMode::Default,
+                tools: agent::default_tools(),
+                color: None,
+                profile: Default::default(),
+            },
+        )
+        .unwrap();
+        let cfg = RunConfig {
+            agent_name: "a".into(),
+            agent_role: "r".into(),
+            model: None,
+            effort: None,
+            permission_mode: PermissionMode::Default,
+            tools: vec![],
+            system_append: String::new(),
+            json_schema: None,
+            limits: Default::default(),
+        };
+        let mk = |session: &str, pid: u32| {
+            let t = task::create_task(&conn, p.id, a.id, "x").unwrap();
+            let r = task::create_run(
+                &conn,
+                task::NewRun {
+                    task_id: t.id,
+                    agent_id: a.id,
+                    prompt: "x",
+                    resume_session_id: None,
+                    config: &cfg,
+                    cwd: &p.path,
+                },
+            )
+            .unwrap();
+            task::mark_run_started(&conn, r.id, session).unwrap();
+            task::set_run_pid(&conn, r.id, Some(pid)).unwrap();
+            r.id
+        };
+        let r_orphan = mk("sess-orphan", orphan.id());
+        // pid는 살아 있지만 세션 id가 다른 프로세스 → pid 재사용으로 보고 건드리지 않음
+        let r_reused = mk("sess-gone", stranger.id());
+
+        recover_on_startup(&conn).unwrap();
+        let _ = orphan.wait();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(
+            sysproc::process_command(orphan.id()).is_none()
+                && !sysproc::signal_group(orphan.id(), 0),
+            "고아 런타임(도구 명령 포함)이 종료되어야 함"
+        );
+        assert!(
+            sysproc::process_command(stranger.id()).is_some(),
+            "다른 프로그램은 그대로"
+        );
+        assert_eq!(
+            task::get_run(&conn, r_orphan).unwrap().status,
+            RunStatus::Interrupted
+        );
+        assert_eq!(
+            task::get_run(&conn, r_reused).unwrap().status,
+            RunStatus::Interrupted
+        );
+        let notes: Vec<_> = task::list_events(&conn, r_orphan).unwrap();
+        assert!(notes.iter().any(|e| matches!(&e.event, crate::runtime::RunEvent::Notice { text } if text.contains("런타임 프로세스"))));
+
+        sysproc::terminate_tree(stranger.id(), std::time::Duration::from_secs(1));
+        let _ = stranger.wait();
     }
 }

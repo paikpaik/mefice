@@ -153,6 +153,17 @@ export interface OfficeAgent {
   last: RunRef | null;
 }
 
+/** 종료 확인 창에 보여줄 진행 중 실행 */
+export interface ActiveRunInfo {
+  runId: number;
+  taskId: number;
+  taskTitle: string;
+  agentName: string;
+  status: RunStatus;
+  /** 격리 작업 공간이면 중단해도 사용자 폴더에 부분 변경이 남지 않는다 */
+  isolated: boolean;
+}
+
 export interface AgentOverview {
   agent: Agent;
   recent: TaskSummary[];
@@ -440,6 +451,7 @@ export const EVENTS = {
   usageUpdated: "usage-updated",
   rateLimitUpdated: "rate-limit-updated",
   pmMessage: "pm-message",
+  quitRequested: "quit-requested",
 } as const;
 
 export const api = {
@@ -479,6 +491,10 @@ export const api = {
   pmSend: (goalId: number | null, text: string) => invoke<number>("pm_send", { goalId, text }),
 
   getTaskDiff: (taskId: number) => invoke<TaskDiff>("get_task_diff", { taskId }),
+  getActiveRuns: () => invoke<ActiveRunInfo[]>("get_active_runs"),
+  confirmQuit: () => invoke<void>("confirm_quit"),
+  keepRunningInBackground: () => invoke<void>("keep_running_in_background"),
+
   listTemplates: () => invoke<TemplateCatalog>("list_templates"),
   getOfficeState: () => invoke<OfficeAgent[]>("get_office_state"),
   getAgentOverview: (agentId: number) => invoke<AgentOverview>("get_agent_overview", { agentId }),

@@ -2,6 +2,47 @@
 
 ## 플랜 실행 이력
 
+### 7단계 완료: 2026-11-22 (MVP 구현 완료)
+
+**결과**: 성공 — 스펙 13장 합격 조건 8개 모두 근거와 함께 충족 (`docs/mvp-acceptance.md`)
+
+**발견한 문제와 수정**:
+- 앱 강제 종료(SIGKILL) 시 `kill_on_drop`이 실행되지 않아 `claude`와 그 도구 명령이 고아로 남아 계속 실행됨 (실측 재현)
+- Claude Code는 Bash 도구 명령을 **별도 프로세스 그룹**으로 띄움 (실측) → 그룹 종료만으로는 부족
+- 수정: 런타임을 새 프로세스 그룹으로 실행, 종료 전에 프로세스 트리를 먼저 수집해 트리 구성원과 그들이 이끄는 그룹에 SIGTERM → 유예 → SIGKILL. 앱 재시작 시 끝나지 않은 Run의 pid를 세션 id로 대조(pid 재사용 방지)해 고아 정리
+- 측정 도구 자체의 교착 상태(DB Mutex 재진입) 수정
+
+**앱 수명주기 (스펙 10장)**:
+- 트레이 아이콘(열기·종료), 창 닫기 시 설정에 따라 트레이로 숨김
+- 종료 요청(Cmd+Q·트레이·창 닫기): 진행 중 작업이 없으면 즉시 종료, 있으면 목록·중단 영향(격리 여부별) 표시 후 "중단 후 종료 / 백그라운드에서 계속 / 취소"
+- 실제 종료 직전 남은 런타임 프로세스 트리 정리, macOS Dock 클릭 시 창 복원
+
+**효율 비교 (`bench.rs`, 결과 `docs/bench/20261122-1444-haiku.md`)**:
+- 같은 초기 저장소·목표·모델(haiku)·권한, node로 완료 검사, 3 시나리오 × 5 방식 × 2회 = 30회 전부 통과
+- 같은 도구 조건 대비: Mefice 직접 실행 ≈ 97%(오차 수준), PM 판단 ≈ 107%(모두 직접 처리), PM 위임 강제 218~419%(시간 2~3배)
+- 사용자 설정 그대로의 터미널은 같은 도구 조건의 232~332% — 전역 MCP·도구 정의 비용(설정 차이)
+- 첫 측정은 터미널 기준 조건이 달라 폐기하고 `baseline_same`, `pm_delegate` 모드를 추가해 재측정
+
+**실제 변경 파일**:
+- `sysproc.rs` — 프로세스 명령줄 조회, 프로세스 트리 수집·종료
+- `executor.rs` — 프로세스 그룹 실행, 강제 종료 시 트리 종료, `active_count`/`cancel_all`/`kill_remaining`, 강제 종료 재현 통합 테스트
+- `task.rs` — `orphaned_runtimes`
+- `lib.rs` — 시작 시 고아 정리, 트레이·창 이벤트·실행 이벤트 연결 (`build().run()`)
+- `lifecycle.rs` (신규) — 트레이, 창 닫기, 종료 확인 흐름
+- `commands.rs` — `get_active_runs`, `confirm_quit`, `keep_running_in_background`
+- `bench.rs` (신규, 테스트 전용) — 효율 비교 측정·보고서
+- `Cargo.toml` — `tray-icon` 기능, `libc`
+- `src/components/QuitDialog.tsx` (신규), `App.tsx`, `api/index.ts`, `styles.css`
+- `docs/mvp-acceptance.md`, `docs/bench/20261122-1444-haiku.{md,json}` (신규)
+
+**검증**:
+- 단위 테스트 55개, 실제 CLI 통합 테스트 9개 통과 (`live_앱_강제종료_후_복구`: 실제 claude + Bash 도구 sleep 실행 중 SIGKILL → 고아 확인 → 재시작 복구로 트리 3개 프로세스 모두 종료, interrupted)
+- 실제 앱: 트레이 설정 포함 정상 기동, 진행 중 작업 없을 때 종료 요청 → 즉시 정상 종료
+
+**남은 결정 (스펙 14장)**:
+- 4번 PM 추가 사용량 허용 기준 — 측정 근거와 제안값을 `docs/mvp-acceptance.md`에 정리, 사용자 결정 필요
+- 5번 캐릭터 아트, 6번 배포·서명·업데이트
+
 ### 6단계 완료: 2026-11-22
 
 **결과**: 성공

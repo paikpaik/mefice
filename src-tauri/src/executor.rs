@@ -85,6 +85,35 @@ impl<R: Runtime> Executor<R> {
         })
     }
 
+    /// 진행 중인 실행 수 (종료 확인용)
+    pub fn active_count(&self) -> usize {
+        self.active.lock().map(|a| a.len()).unwrap_or(0)
+    }
+
+    /// 모든 실행에 중단을 요청한다 (앱 종료 확인 후)
+    pub fn cancel_all(self: &Arc<Self>) {
+        let ids: Vec<i64> = self
+            .active
+            .lock()
+            .map(|a| a.keys().copied().collect())
+            .unwrap_or_default();
+        for id in ids {
+            let _ = self.cancel(id);
+        }
+    }
+
+    /// 앱 종료 직전: 남은 런타임 프로세스 그룹을 정리한다 (kill_on_drop은 직계 자식만 끈다)
+    pub fn kill_remaining(&self) {
+        let Ok(conn) = self.db().conn() else { return };
+        let pids: Vec<i64> = conn
+            .prepare("SELECT pid FROM runs WHERE pid IS NOT NULL")
+            .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+            .unwrap_or_default();
+        for pid in pids {
+            crate::sysproc::kill_tree(pid as u32);
+        }
+    }
+
     /// 블로킹 작업(git 등)을 비동기 런타임 밖에서 DB와 함께 실행한다.
     async fn blocking<T: Send + 'static>(
         &self,
@@ -470,7 +499,9 @@ impl<R: Runtime> Executor<R> {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // 앱이 종료되면 자식도 정리 (재시작 시 interrupted로 표시됨)
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // 새 프로세스 그룹: 강제 종료·앱 재시작 정리 시 도구가 띄운 명령까지 함께 끈다
+            .process_group(0);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -648,6 +679,10 @@ impl<R: Runtime> Executor<R> {
                 _ = tokio::time::sleep_until(kill_deadline.unwrap_or_else(Instant::now)), if kill_deadline.is_some() => {
                     kill_deadline = None;
                     self.record(run_id, RunEvent::Notice { text: "응답이 없어 프로세스를 강제 종료합니다".into() });
+                    // 도구 명령은 별도 프로세스 그룹으로 뜨므로 프로세스 트리째 종료
+                    if let Some(pid) = child.id() {
+                        crate::sysproc::kill_tree(pid);
+                    }
                     let _ = child.start_kill();
                 }
             }
@@ -1327,5 +1362,181 @@ mod live_tests {
             assert_eq!(done.status, RunStatus::Failed);
             assert!(done.error.as_deref().unwrap_or("").contains("턴 제한(1회)"));
         });
+    }
+
+    /// 강제 종료 재현용 자식: 지정한 DB·폴더로 실제 실행을 시작하고 승인만 처리하며 기다린다.
+    /// 부모 테스트(`live_앱_강제종료_후_복구`)가 이 프로세스를 SIGKILL한다. 단독 실행하지 않는다.
+    #[test]
+    #[ignore]
+    fn live_crash_child() {
+        let (Ok(db_path), Ok(proj)) = (
+            std::env::var("MEFICE_CRASH_DB"),
+            std::env::var("MEFICE_CRASH_PROJ"),
+        ) else {
+            return;
+        };
+        let app = mock_app();
+        app.manage(Db::open(std::path::Path::new(&db_path)).unwrap());
+        let handle = app.handle().clone();
+        let exec = Executor::new(
+            handle.clone(),
+            std::path::PathBuf::from(&db_path).with_extension("wt"),
+        );
+        {
+            let conn = handle.state::<Db>().inner().conn().unwrap();
+            let p = project::upsert(&conn, &project::normalize_path(&proj).unwrap()).unwrap();
+            settings::set_current_project_id(&conn, p.id).unwrap();
+            let a = agent::create(
+                &conn,
+                &AgentInput {
+                    name: "t".into(),
+                    role: "r".into(),
+                    instructions: String::new(),
+                    model: Some("haiku".into()),
+                    effort: None,
+                    permission_mode: PermissionMode::AcceptEdits,
+                    tools: vec!["Bash".into()],
+                    color: None,
+                    profile: Default::default(),
+                },
+            )
+            .unwrap();
+            let prompt = "Bash 도구로 sleep 45 를 실행하고, 끝나면 done 이라고 답해.";
+            let t = task::create_task(&conn, p.id, a.id, prompt).unwrap();
+            task::create_run(
+                &conn,
+                task::NewRun {
+                    task_id: t.id,
+                    agent_id: a.id,
+                    prompt,
+                    resume_session_id: None,
+                    config: &crate::pm::run_config(&p, &a),
+                    cwd: &p.path,
+                },
+            )
+            .unwrap();
+        }
+        exec.pump();
+        tauri::async_runtime::block_on(async {
+            loop {
+                let pending: Vec<i64> = {
+                    let c = handle.state::<Db>().inner().conn().unwrap();
+                    c.prepare("SELECT id FROM approvals WHERE status = 'pending'")
+                        .unwrap()
+                        .query_map([], |r| r.get(0))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap()
+                };
+                for id in pending {
+                    let _ = exec.respond_approval(id, true);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+    }
+
+    /// 7단계 완료 기준: 앱이 실행 도중 강제 종료되어도, 재시작하면 남은 런타임·도구 명령을 정리하고
+    /// 실행 상태를 실제와 일치시킨다 (스펙 9·13장).
+    #[test]
+    #[ignore]
+    fn live_앱_강제종료_후_복구() {
+        let data = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let db_path = data.path().join("crash.db");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "executor::live_tests::live_crash_child",
+                "--nocapture",
+            ])
+            .env("MEFICE_CRASH_DB", &db_path)
+            .env("MEFICE_CRASH_PROJ", proj.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // 런타임이 sleep 도구 명령을 시작할 때까지 대기
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let (runtime_pid, session) = loop {
+            assert!(Instant::now() < deadline, "도구 명령이 시작되지 않음");
+            std::thread::sleep(Duration::from_millis(500));
+            let Ok(db) = Db::open(&db_path) else { continue };
+            let conn = db.conn().unwrap();
+            let row: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT pid, session_id FROM runs WHERE pid IS NOT NULL",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            if let Some((pid, sess)) = row {
+                // 도구 명령은 claude와 다른 프로세스 그룹이므로 프로세스 트리에서 찾는다
+                let tool_started =
+                    crate::sysproc::process_tree(pid as u32)
+                        .iter()
+                        .any(|&(p, _)| {
+                            crate::sysproc::process_command(p)
+                                .is_some_and(|c| c.contains("sleep 45"))
+                        });
+                if tool_started {
+                    break (pid as u32, sess);
+                }
+            }
+        };
+
+        // 강제 종료 전 런타임 프로세스 트리 기록 (런타임 + 도구 셸 + sleep)
+        let tree: Vec<u32> = crate::sysproc::process_tree(runtime_pid)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        println!("런타임 트리 pid: {tree:?}");
+        assert!(tree.len() >= 2, "런타임과 도구 명령이 트리에 있어야 함");
+
+        // 앱 강제 종료 재현
+        unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(500));
+        let alive = crate::sysproc::process_command(runtime_pid);
+        println!(
+            "강제 종료 직후 런타임 생존: {:?}",
+            alive.as_deref().map(|c| &c[..c.len().min(60)])
+        );
+        assert!(
+            alive.is_some_and(|c| c.contains(&session)),
+            "고아 런타임이 남아 있어야 재현이 된 것"
+        );
+
+        // 재시작 복구
+        let db = Db::open(&db_path).unwrap();
+        let conn = db.conn().unwrap();
+        crate::recover_on_startup(&conn).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        // 기록해 둔 트리의 모든 프로세스가 사라졌는지 (launchd가 거두는 시간을 고려해 재시도)
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let survivors = loop {
+            let alive: Vec<String> = tree
+                .iter()
+                .filter_map(|&p| {
+                    crate::sysproc::process_command(p)
+                        .map(|c| format!("{p}: {}", &c[..c.len().min(60)]))
+                })
+                .collect();
+            if alive.is_empty() || Instant::now() > deadline {
+                break alive;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        assert!(survivors.is_empty(), "남은 프로세스: {survivors:?}");
+        let run = conn
+            .query_row("SELECT status FROM runs LIMIT 1", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        assert_eq!(run, "interrupted");
+        println!("복구 후: 런타임 종료, 실행 상태 {run}");
     }
 }

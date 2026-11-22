@@ -507,3 +507,25 @@ pub async fn get_agent_overview(
 ) -> AppResult<crate::office::AgentOverview> {
     crate::office::agent_overview(&*db.conn()?, agent_id)
 }
+
+// ---------- 앱 수명주기 (7단계) ----------
+
+/// 종료 확인 창용: 진행 중인 실행 목록
+#[tauri::command]
+pub async fn get_active_runs(db: State<'_, Db>) -> AppResult<Vec<crate::lifecycle::ActiveRunInfo>> {
+    crate::lifecycle::active_runs(&*db.conn()?)
+}
+
+/// "작업 중단 후 종료": 중단 요청 → 최대 8초 대기 → 남은 프로세스 정리 → 종료
+#[tauri::command]
+pub async fn confirm_quit(app: tauri::AppHandle) -> AppResult<()> {
+    crate::lifecycle::confirm_quit(app).await;
+    Ok(())
+}
+
+/// "백그라운드에서 계속": 창만 숨기고 작업은 계속 (트레이에서 다시 열 수 있음)
+#[tauri::command]
+pub async fn keep_running_in_background(app: tauri::AppHandle) -> AppResult<()> {
+    crate::lifecycle::hide_main(&app);
+    Ok(())
+}

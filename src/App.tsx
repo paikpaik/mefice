@@ -3,6 +3,7 @@ import { api, errorMessage, type AppSettings, type ProjectView } from "./api";
 import { Welcome } from "./screens/Welcome";
 import { Settings } from "./screens/Settings";
 import { Office } from "./office/Office";
+import { QuitDialog } from "./components/QuitDialog";
 import { Tasks } from "./screens/Tasks";
 import { PmChat } from "./screens/PmChat";
 import { Team } from "./screens/Team";
@@ -51,6 +52,7 @@ export default function App() {
 
   return (
     <div className="shell">
+      <QuitDialog />
       <nav className="sidebar">
         <div className="brand">
           Mefice <span className="muted">미피스</span>
