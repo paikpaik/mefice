@@ -21,13 +21,17 @@ import { SourceBadges, UsageNumbers } from "../components/Usage";
 
 interface Props {
   onGoTeam: () => void;
+  /** 다른 화면에서 특정 작업을 열 때 */
+  focusTaskId?: number | null;
 }
 
+const MODE_LABEL: Record<string, string> = { pm: "PM 목표", delegated: "위임" };
+
 /** 직접 실행 모드(스펙 4.6) + 작업 목록 + 작업 상세. */
-export function Tasks({ onGoTeam }: Props) {
+export function Tasks({ onGoTeam, focusTaskId = null }: Props) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
-  const [selected, setSelected] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number | null>(focusTaskId);
   const [filter, setFilter] = useState("all");
   const [error, setError] = useState<string | null>(null);
   const active = FILTERS.find((f) => f.id === filter) ?? FILTERS[0];
@@ -36,13 +40,20 @@ export function Tasks({ onGoTeam }: Props) {
   const loadTasks = () => api.listTasks().then(setTasks).catch((e) => setError(errorMessage(e)));
 
   useEffect(() => {
-    api.listAgents().then(setAgents).catch((e) => setError(errorMessage(e)));
+    // 직접 실행 대상에서 PM은 제외 (PM에게는 PM 채팅으로 요청)
+    api
+      .listAgents()
+      .then((all) => setAgents(all.filter((a) => a.kind !== "pm")))
+      .catch((e) => setError(errorMessage(e)));
     loadTasks();
-    // Run 상태 변경 시 목록의 최신 실행 상태만 갱신
+    // Run 상태 변경 시 목록의 최신 실행 상태만 갱신. 모르는 작업이면(PM이 새로 위임) 목록을 다시 읽는다.
     const un = listen<Run>(EVENTS.runUpdated, ({ payload }) => {
       setTasks((prev) => {
         const idx = prev.findIndex((t) => t.id === payload.taskId);
-        if (idx < 0) return prev;
+        if (idx < 0) {
+          loadTasks();
+          return prev;
+        }
         const next = [...prev];
         const cur = next[idx].latestRun;
         if (!cur || payload.id >= cur.id) next[idx] = { ...next[idx], latestRun: payload };
@@ -87,6 +98,7 @@ export function Tasks({ onGoTeam }: Props) {
               <div className="task-title">{t.title}</div>
               <div className="row small">
                 <StatusBadge status={t.latestRun?.status} />
+                {MODE_LABEL[t.mode] && <span className="badge">{MODE_LABEL[t.mode]}</span>}
                 <span className="muted">{t.agentName}</span>
                 {t.latestRun && t.latestRun.attempt > 1 && <span className="muted">#{t.latestRun.attempt}</span>}
               </div>

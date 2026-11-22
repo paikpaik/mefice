@@ -56,9 +56,19 @@ pub struct Agent {
     pub permission_mode: PermissionMode,
     pub tools: Vec<String>,
     pub color: String,
+    /// pm | worker
+    pub kind: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
+
+impl Agent {
+    pub fn is_pm(&self) -> bool {
+        self.kind == KIND_PM
+    }
+}
+
+pub const KIND_PM: &str = "pm";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,7 +111,7 @@ fn blank_to_none(v: &Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-const COLS: &str = "id, name, role, instructions, model, effort, permission_mode, tools, color, created_at, updated_at";
+const COLS: &str = "id, name, role, instructions, model, effort, permission_mode, tools, color, kind, created_at, updated_at";
 
 fn from_row(r: &Row) -> rusqlite::Result<Agent> {
     let tools: String = r.get("tools")?;
@@ -116,6 +126,7 @@ fn from_row(r: &Row) -> rusqlite::Result<Agent> {
         permission_mode: PermissionMode::from_db(&mode),
         tools: serde_json::from_str(&tools).unwrap_or_else(|_| default_tools()),
         color: r.get("color")?,
+        kind: r.get("kind")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })
@@ -127,6 +138,32 @@ pub fn list(conn: &Connection) -> AppResult<Vec<Agent>> {
     ))?;
     let rows = stmt.query_map([], from_row)?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// 위임 가능한 팀원 (PM 제외)
+pub fn list_workers(conn: &Connection) -> AppResult<Vec<Agent>> {
+    Ok(list(conn)?.into_iter().filter(|a| !a.is_pm()).collect())
+}
+
+/// PM 에이전트를 돌려준다. 없으면 기본 설정으로 만든다 (고용·대기에는 토큰이 들지 않음).
+pub fn ensure_pm(conn: &Connection) -> AppResult<Agent> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM agents WHERE kind = 'pm' AND archived_at IS NULL ORDER BY id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return get(conn, id);
+    }
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO agents (name, role, instructions, permission_mode, tools, color, kind, created_at, updated_at)
+         VALUES ('PM', 'PM', '', 'default', ?1, '#8a5cf6', 'pm', ?2, ?2)",
+        params![serde_json::to_string(&default_tools())?, now],
+    )?;
+    get(conn, conn.last_insert_rowid())
 }
 
 pub fn get(conn: &Connection, id: i64) -> AppResult<Agent> {
@@ -188,6 +225,9 @@ pub fn update(conn: &Connection, id: i64, input: &AgentInput) -> AppResult<Agent
 
 /// 해고는 보관 처리한다 (과거 작업·실행 이력이 에이전트를 참조하므로 삭제하지 않음).
 pub fn archive(conn: &Connection, id: i64) -> AppResult<()> {
+    if get(conn, id)?.is_pm() {
+        return Err(AppError::InvalidInput("PM은 내보낼 수 없습니다".into()));
+    }
     conn.execute(
         "UPDATE agents SET archived_at = ?1 WHERE id = ?2",
         params![now_ms(), id],
@@ -231,6 +271,23 @@ mod tests {
         archive(&conn, a.id).unwrap();
         assert!(list(&conn).unwrap().is_empty());
         assert!(get(&conn, a.id).is_ok(), "보관해도 이력 조회용으로 남는다");
+    }
+
+    #[test]
+    fn pm은_하나만_생성되고_위임대상과_보관에서_제외() {
+        let db = Db::open_in_memory().unwrap();
+        let conn = db.conn().unwrap();
+        let pm = ensure_pm(&conn).unwrap();
+        assert!(pm.is_pm());
+        assert_eq!(
+            ensure_pm(&conn).unwrap().id,
+            pm.id,
+            "두 번째 호출은 기존 PM 반환"
+        );
+        let w = create(&conn, &input()).unwrap();
+        let workers: Vec<i64> = list_workers(&conn).unwrap().iter().map(|a| a.id).collect();
+        assert_eq!(workers, vec![w.id]);
+        assert!(archive(&conn, pm.id).is_err());
     }
 
     #[test]

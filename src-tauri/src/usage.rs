@@ -281,6 +281,24 @@ pub fn summary(
     })
 }
 
+/// PM 목표 단위의 역할별 사용량 (목표 자체의 PM 실행 + 위임 작업). PM 추가 사용량 확인용.
+pub fn goal_usage(conn: &Connection, goal_id: i64) -> AppResult<Vec<Grouped>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT u.role, u.role, {TOTALS_SELECT}
+         FROM usage_records u JOIN runs r ON r.id = u.run_id JOIN tasks t ON t.id = r.task_id
+         WHERE t.id = ?1 OR t.parent_id = ?1
+         GROUP BY u.role ORDER BY u.role"
+    ))?;
+    let rows = stmt.query_map([goal_id], |r| {
+        Ok(Grouped {
+            key: r.get(0)?,
+            label: r.get(1)?,
+            totals: totals_from_row(r, 2)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 // ---------- 구독 한도 사용률 (계정 전체) ----------
 
 pub fn save_rate_limit(conn: &Connection, snapshot: &RateLimitSnapshot) -> AppResult<()> {
@@ -348,6 +366,7 @@ mod tests {
             permission_mode: PermissionMode::Default,
             tools: vec![],
             system_append: String::new(),
+            json_schema: None,
         };
         let t = task::create_task(conn, p.id, a.id, "x").unwrap();
         let mk = |resume| {

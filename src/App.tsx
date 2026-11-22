@@ -4,6 +4,7 @@ import { Welcome } from "./screens/Welcome";
 import { Settings } from "./screens/Settings";
 import { Placeholder } from "./screens/Placeholder";
 import { Tasks } from "./screens/Tasks";
+import { PmChat } from "./screens/PmChat";
 import { Team } from "./screens/Team";
 import { UsageScreen } from "./screens/UsageScreen";
 import "./styles.css";
@@ -24,7 +25,13 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [project, setProject] = useState<ProjectView | null>(null);
-  const [tab, setTab] = useState<Tab>("office");
+  const [tab, setTab] = useState<Tab>("pm");
+  // PM 채팅 등에서 특정 작업으로 이동할 때 사용
+  const [focusTask, setFocusTask] = useState<{ id: number; nonce: number } | null>(null);
+  const openTask = (id: number) => {
+    setFocusTask({ id, nonce: Date.now() });
+    setTab("board");
+  };
 
   // 앱 시작 시 저장된 설정과 마지막 프로젝트 복원 (1단계 완료 기준)
   useEffect(() => {
@@ -62,10 +69,10 @@ export default function App() {
         {tab === "office" && (
           <Placeholder title="사무실" stage={6} description="고용한 에이전트가 상태에 따라 일하거나 쉬는 2D 사무실" />
         )}
-        {tab === "pm" && (
-          <Placeholder title="PM 채팅" stage={4} description="작업 목표를 입력하면 PM이 직접 수행·단일 위임·병렬 분할을 결정" />
+        {tab === "pm" && <PmChat onOpenTask={openTask} onGoTeam={() => setTab("team")} />}
+        {tab === "board" && (
+          <Tasks key={focusTask?.nonce} focusTaskId={focusTask?.id ?? null} onGoTeam={() => setTab("team")} />
         )}
-        {tab === "board" && <Tasks onGoTeam={() => setTab("team")} />}
         {tab === "team" && <Team />}
         {tab === "usage" && <UsageScreen />}
         {tab === "settings" && (

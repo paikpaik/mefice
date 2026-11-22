@@ -61,6 +61,9 @@ pub fn build_command(bin: &Path, cwd: &Path, cfg: &RunConfig, session: Session) 
     if !cfg.system_append.trim().is_empty() {
         cmd.args(["--append-system-prompt", &cfg.system_append]);
     }
+    if let Some(schema) = &cfg.json_schema {
+        cmd.args(["--json-schema", schema]);
+    }
     cmd
 }
 
@@ -94,6 +97,11 @@ pub fn summarize_tool_input(name: &str, input: &Value) -> String {
     let s = match name {
         "Bash" => field("command").map(str::to_string),
         "Read" | "Write" | "Edit" => field("file_path").map(str::to_string),
+        // --json-schema 응답은 런타임 내부 도구로 전달된다
+        "StructuredOutput" => field("mode").map(|m| match field("reply") {
+            Some(r) => format!("{m}: {r}"),
+            None => m.to_string(),
+        }),
         "Glob" | "Grep" => field("pattern").map(|p| match field("path") {
             Some(path) => format!("{p} @ {path}"),
             None => p.to_string(),
@@ -264,6 +272,7 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
                 duration_ms: u64_at(&v, "duration_ms"),
                 num_turns: u64_at(&v, "num_turns"),
                 session_totals: parse_session_totals(&v),
+                structured: v.get("structured_output").filter(|x| !x.is_null()).cloned(),
             }));
         }
         ("control_request", _) => {

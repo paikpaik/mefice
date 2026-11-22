@@ -126,6 +126,27 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_usage_session ON usage_records(session_id, id);
     CREATE INDEX idx_usage_created ON usage_records(created_at);
     "#,
+    // v4: PM과 단일 위임 (4단계)
+    r#"
+    -- pm | worker. PM은 프로젝트당 1명, 위임 대상에서 제외
+    ALTER TABLE agents ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker';
+    -- 위임 작업 명세 (목표·범위·입력·완료 조건 JSON)
+    ALTER TABLE tasks ADD COLUMN spec TEXT;
+    CREATE INDEX idx_tasks_parent ON tasks(parent_id);
+
+    -- PM 대화. 목표(goal) = mode 'pm'인 Task 하나
+    CREATE TABLE messages (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id   INTEGER NOT NULL REFERENCES projects(id),
+        goal_task_id INTEGER NOT NULL REFERENCES tasks(id),
+        author       TEXT    NOT NULL,   -- user | pm | system
+        text         TEXT    NOT NULL,
+        payload      TEXT,               -- PM 결정 JSON 등
+        run_id       INTEGER REFERENCES runs(id),
+        created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX idx_messages_goal ON messages(goal_task_id, id);
+    "#,
 ];
 
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {

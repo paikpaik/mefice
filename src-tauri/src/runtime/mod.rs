@@ -24,6 +24,9 @@ pub struct RunConfig {
     pub tools: Vec<String>,
     /// 프로젝트 기본 지침 + 역할 지침. 런타임 시스템 프롬프트에 덧붙인다.
     pub system_append: String,
+    /// 최종 응답을 이 JSON Schema로 강제한다 (PM 결정 등). 3단계 이전 스냅샷에는 없음.
+    #[serde(default)]
+    pub json_schema: Option<String>,
 }
 
 /// 사용량. 런타임이 제공한 값만 채우고, 없으면 None (추정하지 않음).
@@ -136,6 +139,9 @@ pub enum RunEvent {
         /// 세션 누적 사용량 (2단계에서 저장된 이벤트에는 없음)
         #[serde(default)]
         session_totals: Option<SessionTotals>,
+        /// `--json-schema` 사용 시 검증된 구조화 응답
+        #[serde(default)]
+        structured: Option<serde_json::Value>,
     },
     /// 런타임 stderr (진단용, 일부만 저장)
     Stderr {

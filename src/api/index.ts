@@ -64,6 +64,8 @@ export interface Agent {
   permissionMode: PermissionMode;
   tools: string[];
   color: string;
+  /** pm | worker */
+  kind: "pm" | "worker";
   createdAt: number;
   updatedAt: number;
 }
@@ -131,10 +133,62 @@ export interface Task {
   id: number;
   projectId: number;
   agentId: number;
-  mode: string;
+  parentId: number | null;
+  /** direct | pm | delegated */
+  mode: "direct" | "pm" | "delegated";
+  spec: DelegateSpec | null;
   title: string;
   prompt: string;
   createdAt: number;
+}
+
+// ---------- PM (4단계) ----------
+
+export interface DelegateSpec {
+  agentId: number;
+  title: string;
+  goal: string;
+  scope: string;
+  inputs: string;
+  doneCriteria: string;
+}
+
+export interface HireSuggestion {
+  role: string;
+  reason: string;
+  tools: string[];
+}
+
+export type PmMode = "direct" | "delegate" | "ask" | "hire" | "report";
+
+export interface PmDecision {
+  mode: PmMode;
+  reply: string;
+  tasks: DelegateSpec[];
+  hire: HireSuggestion | null;
+}
+
+export interface Message {
+  id: number;
+  projectId: number;
+  goalTaskId: number;
+  author: "user" | "pm" | "system";
+  text: string;
+  /** PM 메시지면 PmDecision, 시스템 메시지면 { taskId, ... } */
+  payload: Record<string, unknown> | null;
+  runId: number | null;
+  createdAt: number;
+}
+
+export interface GoalSummary extends TaskSummary {
+  lastMessage: Message | null;
+  activeChildren: number;
+}
+
+export interface GoalDetail extends TaskSummary {
+  messages: Message[];
+  children: TaskSummary[];
+  usageByRole: UsageGroup[];
 }
 
 export interface TaskSummary extends Task {
@@ -259,6 +313,7 @@ export const EVENTS = {
   runUpdated: "run-updated",
   usageUpdated: "usage-updated",
   rateLimitUpdated: "rate-limit-updated",
+  pmMessage: "pm-message",
 } as const;
 
 export const api = {
@@ -291,6 +346,11 @@ export const api = {
   getUsageSummary: (sinceMs: number | null) => invoke<UsageSummary>("get_usage_summary", { sinceMs }),
   getTaskUsage: (taskId: number) => invoke<RunUsage[]>("get_task_usage", { taskId }),
   getRateLimit: () => invoke<RateLimitSnapshot | null>("get_rate_limit"),
+
+  listGoals: () => invoke<GoalSummary[]>("list_goals"),
+  getGoal: (goalId: number) => invoke<GoalDetail>("get_goal", { goalId }),
+  /** goalId가 null이면 새 목표. 반환값은 목표 id */
+  pmSend: (goalId: number | null, text: string) => invoke<number>("pm_send", { goalId, text }),
 };
 
 /** Rust AppError는 문자열로 직렬화되어 온다. */

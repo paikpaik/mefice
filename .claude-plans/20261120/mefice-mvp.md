@@ -2,6 +2,47 @@
 
 ## 플랜 실행 이력
 
+### 4단계 완료: 2026-11-20
+
+**결과**: 성공
+
+**런타임 검증 (Claude Code 2.1.304)**:
+- `--json-schema <schema>` → `result.structured_output`에 검증된 JSON. 내부적으로 `StructuredOutput` 도구 호출이며 호스트 승인 대상이 아님
+- 스키마만으로는 응답 길이가 제한되지 않음 → PM 지침에 "reply는 짧게" 명시
+
+**설계**:
+- PM 결정: `mode`(direct/delegate/ask/hire/report) + `reply` + `tasks`(최대 1) + `hire`
+- direct는 PM이 같은 Run 안에서 처리 → 작은 작업에 추가 호출 0회
+- 목표 하나 = PM 세션 하나. 후속 메시지·결과 취합은 `--resume`으로 같은 세션 사용, 매 메시지에 팀 요약만 첨부
+- 모델 호출 시점은 두 가지뿐: 사용자 메시지, 위임 작업 완료·실패 이벤트. 사용자 중단·앱 종료 시 PM 호출 안 함
+- 작업자에게는 목표·범위·입력·완료 조건 + "작업 보고" 형식 요구. PM에게는 최종 보고(3000자 제한) + 도구 기록 기반 변경 파일만 전달
+- 결정 처리는 턴 결과마다 (실행 중인 PM에 추가 메시지를 보내도 결정 손실 없음)
+
+**실제 변경 파일**:
+- `db/migrations.rs` — v4: `agents.kind`, `tasks.spec`, `messages`
+- `pm.rs` (신규) — PM 지침·스키마, 실행 설정 스냅샷, 팀 요약, 작업자 지시문·결과 보고 구성, 메시지, `on_pm_turn`, `on_run_finished`, `deliver_to_pm`
+- `agent.rs` — `kind`, `ensure_pm`, `list_workers`, PM 보관 금지
+- `task.rs` — `parent_id`/`spec`, `create_goal`/`create_delegated`, `create_run_with_role`, `list_children`, `changed_files`, `last_result_text`
+- `runtime/*` — `RunConfig.json_schema`, `TurnResult.structured`, StructuredOutput 요약
+- `executor.rs` — PM 턴 훅, 실행 종료 훅(보고 전달: 실행 중 PM이면 메시지, 아니면 이어서 실행), `pm-message` 이벤트
+- `commands.rs` — `list_goals`, `get_goal`, `pm_send`; 스냅샷 생성을 `pm::run_config`로 이동; 직접 실행에서 PM 제외
+- `usage.rs` — `goal_usage` (목표 단위 PM/작업자 사용량)
+- `src/screens/PmChat.tsx` (신규), `App.tsx`(기본 탭 PM, 작업 이동), `Tasks.tsx`, `Team.tsx`, `api/index.ts`, `styles.css`
+
+**계획과의 차이**:
+- 결정 형식을 텍스트 JSON 파싱 대신 런타임 `--json-schema`로 강제
+- PM을 팀 목록 조회 시 자동 생성 (첫 대화 전에 모델 설정 가능)
+
+**검증**:
+- 단위 테스트 35개 통과 (위임 생성, 잘못된 agentId·PM 위임 거부, 완료 시에만 보고, 중단 시 PM 미호출, 변경 파일 추출, 실행 중 PM에 메시지 전달·종료 후 세션 이어서), clippy 경고 0, `pnpm build` 성공
+- 실제 CLI 통합 테스트 4개 통과. PM 흐름: 사용자 → PM(delegate) → 배정 → 작업자 실행·파일 생성 → 완료 → PM(report). PM 호출 2회(계획+취합), 취합은 같은 세션 재개
+- 실측 (haiku, 아주 작은 작업): PM $0.0034 vs 작업자 $0.0019 → 작은 작업은 위임이 손해. 직접 처리 우선 정책의 근거
+- 실제 앱 실행으로 DB v3 → v4 마이그레이션 확인
+
+**잔존 작업**:
+- 병렬 분할(`tasks` 여러 개)과 의존성은 5단계에서 스키마 `maxItems` 해제와 함께
+- 실행 중 질문 도구(`waiting_for_input`)는 미지원 — PM `ask`와 작업자 보고로 대체
+
 ### 3단계 완료: 2026-11-20
 
 **결과**: 성공

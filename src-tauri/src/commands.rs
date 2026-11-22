@@ -12,8 +12,9 @@ use crate::db::Db;
 use crate::env_check::{self, EnvironmentReport};
 use crate::error::{AppError, AppResult};
 use crate::executor::Executor;
+use crate::pm::{self, Message};
 use crate::project::{self, Project, ProjectView};
-use crate::runtime::{RateLimitSnapshot, RunConfig};
+use crate::runtime::RateLimitSnapshot;
 use crate::settings::{self, AppSettings};
 use crate::task::{self, Approval, Run, StoredEvent, Task, TaskSummary};
 use crate::usage;
@@ -104,7 +105,10 @@ pub async fn check_environment() -> AppResult<EnvironmentReport> {
 
 #[tauri::command]
 pub async fn list_agents(db: State<'_, Db>) -> AppResult<Vec<Agent>> {
-    agent::list(&*db.conn()?)
+    let conn = db.conn()?;
+    // PM은 항상 팀에 있다 (모델 등 설정을 첫 대화 전에 바꿀 수 있도록). 생성·대기에 토큰은 들지 않는다.
+    agent::ensure_pm(&conn)?;
+    agent::list(&conn)
 }
 
 #[tauri::command]
@@ -130,31 +134,6 @@ fn current_project(conn: &Connection) -> AppResult<Project> {
     project::get(conn, id)?.ok_or_else(|| AppError::NotFound(format!("프로젝트 #{id}")))
 }
 
-/// Run 생성 시점의 설정 스냅샷. 이후 에이전트·지침 변경은 다음 실행부터 반영된다 (스펙 4.3).
-pub(crate) fn snapshot(project: &Project, agent: &Agent) -> RunConfig {
-    let mut sys = format!(
-        "당신은 Mefice 개발팀의 '{}' 역할 에이전트 '{}'입니다.",
-        agent.role, agent.name
-    );
-    if !agent.instructions.trim().is_empty() {
-        sys.push_str("\n\n## 역할 지침\n");
-        sys.push_str(agent.instructions.trim());
-    }
-    if !project.instructions.trim().is_empty() {
-        sys.push_str("\n\n## 프로젝트 지침\n");
-        sys.push_str(project.instructions.trim());
-    }
-    RunConfig {
-        agent_name: agent.name.clone(),
-        agent_role: agent.role.clone(),
-        model: agent.model.clone(),
-        effort: agent.effort.clone(),
-        permission_mode: agent.permission_mode,
-        tools: agent.tools.clone(),
-        system_append: sys,
-    }
-}
-
 fn summary(conn: &Connection, task: Task) -> AppResult<TaskSummary> {
     let agent_name = agent::get(conn, task.agent_id)?.name;
     let latest_run = task::latest_run(conn, task.id)?;
@@ -177,6 +156,11 @@ pub async fn start_direct_task(
         let conn = db.conn()?;
         let project = current_project(&conn)?;
         let agent = agent::get(&conn, agent_id)?;
+        if agent.is_pm() {
+            return Err(AppError::InvalidInput(
+                "PM에게는 PM 채팅으로 요청하세요".into(),
+            ));
+        }
         let task = task::create_task(&conn, project.id, agent.id, &prompt)?;
         task::create_run(
             &conn,
@@ -185,7 +169,7 @@ pub async fn start_direct_task(
                 agent_id: agent.id,
                 prompt: &prompt,
                 resume_session_id: None,
-                config: &snapshot(&project, &agent),
+                config: &pm::run_config(&project, &agent),
                 cwd: &project.path,
             },
         )?;
@@ -254,7 +238,7 @@ fn new_run_for_task(db: &Db, task_id: i64, follow_up: Option<String>) -> AppResu
             agent_id: agent.id,
             prompt,
             resume_session_id: resume.as_deref(),
-            config: &snapshot(&project, &agent),
+            config: &pm::run_config(&project, &agent),
             cwd: &project.path,
         },
     )
@@ -342,4 +326,108 @@ pub async fn get_task_usage(db: State<'_, Db>, task_id: i64) -> AppResult<Vec<us
 #[tauri::command]
 pub async fn get_rate_limit(db: State<'_, Db>) -> AppResult<Option<RateLimitSnapshot>> {
     usage::load_rate_limit(&*db.conn()?)
+}
+
+// ---------- PM (4단계) ----------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalSummary {
+    #[serde(flatten)]
+    pub summary: TaskSummary,
+    pub last_message: Option<Message>,
+    /// 진행 중인 위임 작업 수
+    pub active_children: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalDetail {
+    #[serde(flatten)]
+    pub summary: TaskSummary,
+    pub messages: Vec<Message>,
+    pub children: Vec<TaskSummary>,
+    /// 역할별 사용량 (PM 추가 사용량 확인용, 스펙 13장)
+    pub usage_by_role: Vec<usage::Grouped>,
+}
+
+fn goal_summary(conn: &Connection, goal: Task) -> AppResult<GoalSummary> {
+    let children = task::list_children(conn, goal.id)?;
+    let mut active_children = 0;
+    for c in &children {
+        if task::latest_run(conn, c.id)?.is_some_and(|r| !r.status.is_terminal()) {
+            active_children += 1;
+        }
+    }
+    let last_message = pm::last_message(conn, goal.id)?;
+    Ok(GoalSummary {
+        summary: summary(conn, goal)?,
+        last_message,
+        active_children,
+    })
+}
+
+#[tauri::command]
+pub async fn list_goals(db: State<'_, Db>) -> AppResult<Vec<GoalSummary>> {
+    let conn = db.conn()?;
+    let project = current_project(&conn)?;
+    pm::list_goals(&conn, project.id)?
+        .into_iter()
+        .map(|g| goal_summary(&conn, g))
+        .collect()
+}
+
+#[tauri::command]
+pub async fn get_goal(db: State<'_, Db>, goal_id: i64) -> AppResult<GoalDetail> {
+    let conn = db.conn()?;
+    let goal = task::get_task(&conn, goal_id)?;
+    if goal.mode != task::MODE_PM {
+        return Err(AppError::InvalidInput("PM 목표가 아닙니다".into()));
+    }
+    let children = task::list_children(&conn, goal_id)?
+        .into_iter()
+        .map(|c| summary(&conn, c))
+        .collect::<AppResult<_>>()?;
+    Ok(GoalDetail {
+        messages: pm::list_messages(&conn, goal_id)?,
+        usage_by_role: usage::goal_usage(&conn, goal_id)?,
+        summary: summary(&conn, goal)?,
+        children,
+    })
+}
+
+/// PM에게 메시지를 보낸다. `goal_id`가 없으면 새 목표를 시작한다.
+#[tauri::command]
+pub async fn pm_send(
+    db: State<'_, Db>,
+    executor: State<'_, Arc<Executor>>,
+    goal_id: Option<i64>,
+    text: String,
+) -> AppResult<i64> {
+    if text.trim().is_empty() {
+        return Err(AppError::InvalidInput("메시지를 입력하세요".into()));
+    }
+    let (goal_id, delivery, msg) = {
+        let conn = db.conn()?;
+        let project = current_project(&conn)?;
+        match goal_id {
+            None => {
+                let (goal, msg, _run) = pm::start_goal(&conn, &project, &text)?;
+                (goal.id, pm::Delivery::Queued, msg)
+            }
+            Some(id) => {
+                let goal = task::get_task(&conn, id)?;
+                let prompt = pm::user_followup_prompt(&conn, &text)?;
+                let delivery = pm::deliver_to_pm(&conn, &project, &goal, prompt)?;
+                let msg = pm::add_message(&conn, &goal, "user", &text, None, None)?;
+                (goal.id, delivery, msg)
+            }
+        }
+    };
+    executor.emit_message(&msg);
+    match delivery {
+        pm::Delivery::Queued => executor.pump(),
+        pm::Delivery::SendTo { run_id, prompt } => executor.send_message(run_id, prompt).await?,
+    }
+    Ok(goal_id)
 }

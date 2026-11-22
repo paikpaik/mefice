@@ -4,6 +4,7 @@ mod db;
 mod env_check;
 mod error;
 mod executor;
+mod pm;
 mod project;
 mod runtime;
 mod settings;
@@ -59,6 +60,9 @@ pub fn run() {
             commands::get_usage_summary,
             commands::get_task_usage,
             commands::get_rate_limit,
+            commands::list_goals,
+            commands::get_goal,
+            commands::pm_send,
         ])
         .run(tauri::generate_context!())
         .expect("Mefice 실행 중 오류가 발생했습니다");
@@ -146,6 +150,7 @@ mod restore_tests {
                 permission_mode: PermissionMode::Default,
                 tools: vec![],
                 system_append: String::new(),
+                json_schema: None,
             };
             let mk = |prompt: &str| {
                 let t = task::create_task(&conn, p.id, a.id, prompt).unwrap();

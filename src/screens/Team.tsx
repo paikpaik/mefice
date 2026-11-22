@@ -80,6 +80,7 @@ export function Team() {
                 <tr key={a.id}>
                   <td>
                     <span className="dot" style={{ background: a.color }} /> {a.name}
+                    {a.kind === "pm" && <span className="badge info"> PM</span>}
                   </td>
                   <td>{a.role}</td>
                   <td className="mono">{a.model ?? "기본값"}</td>
@@ -104,7 +105,7 @@ export function Team() {
                     >
                       수정
                     </button>
-                    <button onClick={() => archive(a)}>내보내기</button>
+                    {a.kind !== "pm" && <button onClick={() => archive(a)}>내보내기</button>}
                   </td>
                 </tr>
               ))}

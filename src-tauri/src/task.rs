@@ -71,7 +71,12 @@ pub struct Task {
     pub id: i64,
     pub project_id: i64,
     pub agent_id: i64,
+    /// PM 목표(mode=pm)에서 위임된 작업이면 그 목표 Task id
+    pub parent_id: Option<i64>,
+    /// direct(직접 실행) | pm(PM 목표) | delegated(PM이 위임)
     pub mode: String,
+    /// 위임 명세 (목표·범위·입력·완료 조건)
+    pub spec: Option<Value>,
     pub title: String,
     pub prompt: String,
     pub created_at: i64,
@@ -142,7 +147,11 @@ fn task_from_row(r: &Row) -> rusqlite::Result<Task> {
         id: r.get("id")?,
         project_id: r.get("project_id")?,
         agent_id: r.get("agent_id")?,
+        parent_id: r.get("parent_id")?,
         mode: r.get("mode")?,
+        spec: r
+            .get::<_, Option<String>>("spec")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
         title: r.get("title")?,
         prompt: r.get("prompt")?,
         created_at: r.get("created_at")?,
@@ -168,9 +177,93 @@ pub fn create_task(
     if prompt.trim().is_empty() {
         return Err(AppError::InvalidInput("작업 내용을 입력하세요".into()));
     }
+    insert_task(
+        conn,
+        project_id,
+        agent_id,
+        None,
+        "direct",
+        &title_from_prompt(prompt),
+        prompt,
+        None,
+    )
+}
+
+pub const MODE_PM: &str = "pm";
+pub const MODE_DELEGATED: &str = "delegated";
+
+/// PM 목표 Task (대화 스레드 단위)
+pub fn create_goal(
+    conn: &Connection,
+    project_id: i64,
+    pm_agent_id: i64,
+    text: &str,
+) -> AppResult<Task> {
+    if text.trim().is_empty() {
+        return Err(AppError::InvalidInput("메시지를 입력하세요".into()));
+    }
+    insert_task(
+        conn,
+        project_id,
+        pm_agent_id,
+        None,
+        MODE_PM,
+        &title_from_prompt(text),
+        text,
+        None,
+    )
+}
+
+/// PM이 위임한 작업
+pub fn create_delegated(
+    conn: &Connection,
+    goal: &Task,
+    agent_id: i64,
+    title: &str,
+    prompt: &str,
+    spec: &Value,
+) -> AppResult<Task> {
+    let title = if title.trim().is_empty() {
+        title_from_prompt(prompt)
+    } else {
+        crate::runtime::truncate_chars(title.trim(), 60).0
+    };
+    insert_task(
+        conn,
+        goal.project_id,
+        agent_id,
+        Some(goal.id),
+        MODE_DELEGATED,
+        &title,
+        prompt,
+        Some(spec),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_task(
+    conn: &Connection,
+    project_id: i64,
+    agent_id: i64,
+    parent_id: Option<i64>,
+    mode: &str,
+    title: &str,
+    prompt: &str,
+    spec: Option<&Value>,
+) -> AppResult<Task> {
     conn.execute(
-        "INSERT INTO tasks (project_id, agent_id, mode, title, prompt, created_at) VALUES (?1, ?2, 'direct', ?3, ?4, ?5)",
-        params![project_id, agent_id, title_from_prompt(prompt), prompt, now_ms()],
+        "INSERT INTO tasks (project_id, agent_id, parent_id, mode, title, prompt, spec, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            project_id,
+            agent_id,
+            parent_id,
+            mode,
+            title,
+            prompt,
+            spec.map(|v| v.to_string()),
+            now_ms()
+        ],
     )?;
     get_task(conn, conn.last_insert_rowid())
 }
@@ -242,14 +335,19 @@ pub struct NewRun<'a> {
 
 /// 새 실행 시도를 queued 상태로 만든다. 재실행·이어서 실행도 항상 새 Run이다 (스펙 8장).
 pub fn create_run(conn: &Connection, n: NewRun) -> AppResult<Run> {
+    create_run_with_role(conn, n, "worker")
+}
+
+/// 사용량 구분 역할(pm | worker | review)을 지정해 Run을 만든다.
+pub fn create_run_with_role(conn: &Connection, n: NewRun, role: &str) -> AppResult<Run> {
     let attempt: i64 = conn.query_row(
         "SELECT COALESCE(MAX(attempt), 0) + 1 FROM runs WHERE task_id = ?1",
         [n.task_id],
         |r| r.get(0),
     )?;
     conn.execute(
-        "INSERT INTO runs (task_id, agent_id, attempt, status, prompt, resume_session_id, config_snapshot, cwd, created_at)
-         VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO runs (task_id, agent_id, attempt, status, prompt, resume_session_id, config_snapshot, cwd, created_at, role)
+         VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             n.task_id,
             n.agent_id,
@@ -258,7 +356,8 @@ pub fn create_run(conn: &Connection, n: NewRun) -> AppResult<Run> {
             n.resume_session_id,
             serde_json::to_string(n.config)?,
             n.cwd,
-            now_ms()
+            now_ms(),
+            role
         ],
     )?;
     get_run(conn, conn.last_insert_rowid())
@@ -278,6 +377,38 @@ pub fn latest_run(conn: &Connection, task_id: i64) -> AppResult<Option<Run>> {
             run_from_row,
         )
         .optional()?)
+}
+
+/// 목표에서 위임된 작업들
+pub fn list_children(conn: &Connection, parent_id: i64) -> AppResult<Vec<Task>> {
+    let mut stmt = conn.prepare("SELECT * FROM tasks WHERE parent_id = ?1 ORDER BY id")?;
+    let rows = stmt.query_map([parent_id], task_from_row)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// 실행의 마지막 턴 결과 텍스트 (작업자 보고 취합용)
+pub fn last_result_text(conn: &Connection, run_id: i64) -> AppResult<Option<String>> {
+    Ok(list_events(conn, run_id)?
+        .into_iter()
+        .rev()
+        .find_map(|e| match e.event {
+            RunEvent::TurnResult { result, .. } => result,
+            _ => None,
+        }))
+}
+
+/// 도구 기록에서 수정한 파일 경로를 뽑는다 (모델에게 묻지 않고 로컬에서 계산).
+pub fn changed_files(conn: &Connection, run_id: i64) -> AppResult<Vec<String>> {
+    let mut files: Vec<String> = Vec::new();
+    for e in list_events(conn, run_id)? {
+        if let RunEvent::ToolUse { name, summary, .. } = e.event
+            && (name == "Edit" || name == "Write")
+            && !files.contains(&summary)
+        {
+            files.push(summary);
+        }
+    }
+    Ok(files)
 }
 
 pub fn list_runs(conn: &Connection, task_id: i64) -> AppResult<Vec<Run>> {
@@ -525,6 +656,7 @@ mod tests {
             permission_mode: PermissionMode::Default,
             tools: vec!["Read".into()],
             system_append: String::new(),
+            json_schema: None,
         };
         (p.id, a.id, cfg)
     }

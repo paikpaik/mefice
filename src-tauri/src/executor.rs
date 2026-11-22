@@ -18,6 +18,7 @@ use tokio::time::Instant;
 
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
+use crate::pm;
 use crate::runtime::claude_code::{self, Session};
 use crate::runtime::{Parsed, RunEvent};
 use crate::settings;
@@ -36,6 +37,8 @@ pub const EVENT_RUN_UPDATED: &str = "run-updated";
 pub const EVENT_USAGE_UPDATED: &str = "usage-updated";
 /// 구독 한도 사용률 갱신 (payload: RateLimitSnapshot)
 pub const EVENT_RATE_LIMIT: &str = "rate-limit-updated";
+/// PM 대화 메시지 추가 (payload: pm::Message)
+pub const EVENT_PM_MESSAGE: &str = "pm-message";
 
 /// 실행 중인 Run에 보내는 제어 메시지
 enum Control {
@@ -262,10 +265,96 @@ impl<R: Runtime> Executor<R> {
             }
         }
         self.notify_run(run_id);
+        self.after_run_finished(run_id).await;
         self.pump();
     }
 
-    async fn drive_inner(&self, run_id: i64, rx: &mut mpsc::UnboundedReceiver<Control>) -> Outcome {
+    pub fn emit_message(&self, msg: &pm::Message) {
+        let _ = self.app.emit(EVENT_PM_MESSAGE, msg);
+    }
+
+    /// PM 턴 결과 → 결정 메시지 기록, 위임 작업 생성
+    fn after_pm_turn(
+        self: &Arc<Self>,
+        run: &task::Run,
+        structured: Option<&serde_json::Value>,
+        result: Option<&str>,
+        is_error: bool,
+    ) {
+        let fx = self
+            .db()
+            .conn()
+            .and_then(|c| pm::on_pm_turn(&c, run, structured, result, is_error));
+        match fx {
+            Ok(fx) => {
+                for m in &fx.messages {
+                    self.emit_message(m);
+                }
+                if fx.queued {
+                    self.pump();
+                }
+            }
+            Err(e) => eprintln!("[executor] PM 결정 처리 실패 run={}: {e}", run.id),
+        }
+    }
+
+    /// 실행 종료 → PM 쪽 알림, 위임 작업이면 PM에게 결과 보고 (이벤트 기반, 폴링 없음)
+    async fn after_run_finished(self: &Arc<Self>, run_id: i64) {
+        let fx = self.db().conn().and_then(|c| {
+            let run = task::get_run(&c, run_id)?;
+            pm::on_run_finished(&c, &run)
+        });
+        let fx = match fx {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("[executor] 실행 종료 후처리 실패 run={run_id}: {e}");
+                return;
+            }
+        };
+        for m in &fx.messages {
+            self.emit_message(m);
+        }
+        let Some((goal, prompt)) = fx.report else {
+            return;
+        };
+        let delivery = self.db().conn().and_then(|c| {
+            let project = crate::project::get(&c, goal.project_id)?
+                .ok_or_else(|| AppError::NotFound(format!("프로젝트 #{}", goal.project_id)))?;
+            pm::deliver_to_pm(&c, &project, &goal, prompt)
+        });
+        match delivery {
+            Ok(pm::Delivery::Queued) => {} // 호출부에서 pump
+            Ok(pm::Delivery::SendTo {
+                run_id: pm_run,
+                prompt,
+            }) => {
+                if let Err(e) = self.send_message(pm_run, prompt).await {
+                    eprintln!("[executor] PM 보고 전달 실패: {e}");
+                }
+            }
+            Err(e) => {
+                let note = self.db().conn().and_then(|c| {
+                    pm::add_message(
+                        &c,
+                        &goal,
+                        "system",
+                        &format!("PM에게 결과를 전달하지 못했습니다: {e}"),
+                        None,
+                        None,
+                    )
+                });
+                if let Ok(m) = note {
+                    self.emit_message(&m);
+                }
+            }
+        }
+    }
+
+    async fn drive_inner(
+        self: &Arc<Self>,
+        run_id: i64,
+        rx: &mut mpsc::UnboundedReceiver<Control>,
+    ) -> Outcome {
         let run = match self.db().conn().and_then(|c| task::get_run(&c, run_id)) {
             Ok(r) => r,
             Err(e) => return Outcome::failed(e.to_string()),
@@ -339,7 +428,7 @@ impl<R: Runtime> Executor<R> {
                                             }
                                         }
                                     }
-                                    RunEvent::TurnResult { is_error, result, subtype, usage: turn, session_totals, .. } => {
+                                    RunEvent::TurnResult { is_error, result, subtype, usage: turn, session_totals, structured, .. } => {
                                         let recorded = self.db().conn().and_then(|c| usage::record_turn(
                                             &c, run_id, Some(&current_session), &run.role, turn, session_totals.as_ref(),
                                         ));
@@ -352,6 +441,9 @@ impl<R: Runtime> Executor<R> {
                                         last_result = Some((*is_error, err_text));
                                         if pending_turns == 0 {
                                             stdin = None; // stdin 닫기 → 런타임 정상 종료
+                                        }
+                                        if run.role == "pm" && !cancel_requested {
+                                            self.after_pm_turn(&run, structured.as_ref(), result.as_deref(), *is_error);
                                         }
                                     }
                                     _ => {}
@@ -513,6 +605,7 @@ async fn write_line(stdin: &mut Option<ChildStdin>, line: &str) -> bool {
 mod live_tests {
     use super::*;
     use crate::agent::{self, AgentInput, PermissionMode};
+    use crate::pm;
     use crate::project;
     use crate::runtime::RunEvent;
     use tauri::test::{MockRuntime, mock_app};
@@ -580,7 +673,7 @@ mod live_tests {
                     agent_id: a.id,
                     prompt,
                     resume_session_id: None,
-                    config: &crate::commands::snapshot(&p, &a),
+                    config: &crate::pm::run_config(&p, &a),
                     cwd: &p.path,
                 },
             )
@@ -763,6 +856,133 @@ mod live_tests {
             let rl = usage::load_rate_limit(&conn).unwrap();
             println!("구독 한도: {rl:?}");
             assert!(rl.is_some_and(|s| s.observed_at > 0));
+        });
+    }
+
+    /// 4단계 완료 기준: 목표·범위·완료 조건을 전달하고 결과를 취합한다.
+    #[test]
+    #[ignore]
+    fn live_pm_단일위임과_결과취합() {
+        let (env, worker_id) = setup(PermissionMode::AcceptEdits);
+        tauri::async_runtime::block_on(async {
+            let goal_id = {
+                let conn = env.handle.state::<Db>().inner().conn().unwrap();
+                // 테스트 비용을 줄이기 위해 PM도 haiku 사용
+                let pm = agent::ensure_pm(&conn).unwrap();
+                conn.execute("UPDATE agents SET model = 'haiku' WHERE id = ?1", [pm.id])
+                    .unwrap();
+                let pid = settings::current_project_id(&conn).unwrap().unwrap();
+                let p = project::get(&conn, pid).unwrap().unwrap();
+                let (goal, _, _) = pm::start_goal(
+                    &conn,
+                    &p,
+                    "작업 디렉터리에 hello.txt를 만들고 내용은 hi 로 해줘. 이 작업은 직접 하지 말고 반드시 팀원에게 위임해.",
+                )
+                .unwrap();
+                goal.id
+            };
+            env.exec.pump();
+
+            // PM 결과 보고(report)까지 대기. 승인 요청이 오면 기록하고 허용한다.
+            let deadline = Instant::now() + Duration::from_secs(240);
+            let mut approvals_seen = Vec::new();
+            loop {
+                let (msgs, pending) = {
+                    let conn = env.handle.state::<Db>().inner().conn().unwrap();
+                    let msgs = pm::list_messages(&conn, goal_id).unwrap();
+                    let mut pending = Vec::new();
+                    let mut ids = vec![goal_id];
+                    ids.extend(
+                        task::list_children(&conn, goal_id)
+                            .unwrap()
+                            .iter()
+                            .map(|t| t.id),
+                    );
+                    for tid in ids {
+                        for r in task::list_runs(&conn, tid).unwrap() {
+                            pending.extend(task::pending_approvals(&conn, r.id).unwrap());
+                        }
+                    }
+                    (msgs, pending)
+                };
+                for ap in pending {
+                    approvals_seen.push(ap.tool_name.clone());
+                    env.exec.respond_approval(ap.id, true).unwrap();
+                }
+                let reported = msgs.iter().any(|m| {
+                    m.author == "pm" && m.payload.as_ref().is_some_and(|p| p["mode"] == "report")
+                });
+                let failed = msgs
+                    .iter()
+                    .any(|m| m.author == "system" && m.text.contains("실패"));
+                if reported || failed {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "시간 초과. 메시지: {:#?}",
+                    msgs.iter()
+                        .map(|m| (&m.author, &m.text))
+                        .collect::<Vec<_>>()
+                );
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            // 마지막 PM Run이 끝날 때까지 대기
+            let last_pm = {
+                let conn = env.handle.state::<Db>().inner().conn().unwrap();
+                task::latest_run(&conn, goal_id).unwrap().unwrap().id
+            };
+            wait_until(&env, last_pm, 60, |r| r.status.is_terminal()).await;
+
+            let conn = env.handle.state::<Db>().inner().conn().unwrap();
+            let msgs = pm::list_messages(&conn, goal_id).unwrap();
+            for m in &msgs {
+                println!("[{}] {}", m.author, m.text.replace('\n', " / "));
+            }
+            println!("승인 요청된 도구: {approvals_seen:?}");
+            let authors: Vec<&str> = msgs.iter().map(|m| m.author.as_str()).collect();
+            assert_eq!(authors.first(), Some(&"user"));
+            assert!(
+                msgs.iter()
+                    .any(|m| m.payload.as_ref().is_some_and(|p| p["mode"] == "delegate"))
+            );
+            assert!(msgs.iter().any(|m| m.text.starts_with("작업 배정")));
+            assert!(msgs.iter().any(|m| m.text.starts_with("작업 완료")));
+            assert!(
+                msgs.last()
+                    .unwrap()
+                    .payload
+                    .as_ref()
+                    .is_some_and(|p| p["mode"] == "report")
+            );
+
+            let children = task::list_children(&conn, goal_id).unwrap();
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].agent_id, worker_id);
+            assert_eq!(
+                std::fs::read_to_string(env.proj.path().join("hello.txt"))
+                    .unwrap()
+                    .trim(),
+                "hi"
+            );
+
+            let by_role = usage::goal_usage(&conn, goal_id).unwrap();
+            for g in &by_role {
+                println!("{} → {:?}", g.key, g.totals);
+            }
+            let roles: Vec<&str> = by_role.iter().map(|g| g.key.as_str()).collect();
+            assert!(roles.contains(&"pm") && roles.contains(&"worker"));
+            let pm_runs = task::list_runs(&conn, goal_id).unwrap();
+            println!("PM 실행 횟수: {}", pm_runs.len());
+            assert_eq!(
+                pm_runs.len(),
+                2,
+                "계획 1회 + 취합 1회 (상태 확인 호출 없음)"
+            );
+            assert_eq!(
+                pm_runs[1].resume_session_id, pm_runs[0].session_id,
+                "취합은 같은 PM 세션을 이어서"
+            );
         });
     }
 }
