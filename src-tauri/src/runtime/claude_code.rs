@@ -43,11 +43,16 @@ pub fn build_command(bin: &Path, cwd: &Path, cfg: &RunConfig, session: Session) 
             "stdio",
             "--permission-mode",
             cfg.permission_mode.as_cli(),
-            // MCP는 MVP 범위 밖(스펙 10장). 사용자 전역 MCP 도구 정의가 프롬프트에 실리지 않게 한다.
-            "--strict-mcp-config",
-        ])
-        .arg("--tools")
-        .arg(cfg.tools.join(","));
+        ]);
+    if !cfg.full_settings {
+        // 절약 모드: 사용자 전역 MCP·도구 정의가 프롬프트에 실리지 않게 한다 (측정상 비용 약 1/2.5~1/3)
+        cmd.arg("--strict-mcp-config")
+            .arg("--tools")
+            .arg(cfg.tools.join(","));
+    }
+    if cfg.stream_partial {
+        cmd.arg("--include-partial-messages");
+    }
     match session {
         Session::New(id) => cmd.args(["--session-id", id]),
         Session::Resume(id) => cmd.args(["--resume", id]),
@@ -89,13 +94,93 @@ pub fn encode_interrupt(request_id: &str) -> String {
 }
 
 pub fn encode_permission_response(request_id: &str, allow: bool, input: &Value) -> String {
-    let response = if allow {
-        json!({"behavior":"allow","updatedInput":input})
+    if allow {
+        encode_allow(request_id, input, &[])
     } else {
-        json!({"behavior":"deny","message":"사용자가 이 도구 실행을 거부했습니다."})
-    };
+        encode_deny(request_id, "사용자가 이 도구 실행을 거부했습니다.")
+    }
+}
+
+/// 허용. `permissions`는 런타임에 적용할 권한 변경 (세션 허용 시 `session_permissions` 결과)
+pub fn encode_allow(request_id: &str, input: &Value, permissions: &[Value]) -> String {
+    let mut response = json!({"behavior":"allow","updatedInput":input});
+    if !permissions.is_empty() {
+        response["updatedPermissions"] = Value::Array(permissions.to_vec());
+    }
     json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,"response":response}})
         .to_string()
+}
+
+pub fn encode_deny(request_id: &str, message: &str) -> String {
+    json!({"type":"control_response","response":{"subtype":"success","request_id":request_id,
+        "response":{"behavior":"deny","message":message}}})
+    .to_string()
+}
+
+/// "이 세션 동안 허용": 런타임 제안 중 세션에만 적용되는 것만 고른다.
+/// 실측: 제안을 그대로 적용하면 `addRules`가 사용자 폴더의 `.claude/settings.local.json`에 영구 저장된다.
+/// 그래서 규칙은 저장 위치를 session으로 바꾸고, 그 밖의 제안은 원래 session인 것만 남긴다.
+pub fn session_permissions(suggestions: &Value) -> Vec<Value> {
+    suggestions
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let mut s = s.clone();
+                    if s.get("type").and_then(Value::as_str) == Some("addRules") {
+                        s["destination"] = json!("session");
+                        Some(s)
+                    } else {
+                        (s.get("destination").and_then(Value::as_str) == Some("session"))
+                            .then_some(s)
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 질문 도구(AskUserQuestion) 답: 원래 입력에 `answers`({질문: 답})를 더해 허용한다 (실측)
+pub fn with_answers(input: &Value, answers: &Value) -> Value {
+    let mut v = input.clone();
+    v["answers"] = answers.clone();
+    v
+}
+
+/// 대화 중 모드 전환 (실측: 즉시 적용, `system/status`에 permissionMode로 알림)
+pub fn encode_set_mode(request_id: &str, mode: &str) -> String {
+    json!({"type":"control_request","request_id":request_id,"request":{"subtype":"set_permission_mode","mode":mode}})
+        .to_string()
+}
+
+const DETAIL_CHARS: usize = 4000;
+
+fn cut(v: Option<&Value>, max: usize) -> Value {
+    match v.and_then(Value::as_str) {
+        Some(s) => json!(truncate_chars(s, max).0),
+        None => v.cloned().unwrap_or(Value::Null),
+    }
+}
+
+/// 카드 표시용 도구 상세. 길이를 제한해 저장한다 (diff·할 일·질문·계획).
+pub fn tool_detail(name: &str, input: &Value) -> Option<Value> {
+    let f = |k: &str| input.get(k);
+    match name {
+        "Edit" => Some(
+            json!({"filePath": f("file_path"), "oldString": cut(f("old_string"), DETAIL_CHARS),
+            "newString": cut(f("new_string"), DETAIL_CHARS), "replaceAll": f("replace_all")}),
+        ),
+        "Write" => {
+            Some(json!({"filePath": f("file_path"), "content": cut(f("content"), DETAIL_CHARS)}))
+        }
+        "Bash" => Some(
+            json!({"command": cut(f("command"), DETAIL_CHARS), "description": f("description")}),
+        ),
+        "TodoWrite" => Some(json!({"todos": f("todos")})),
+        "AskUserQuestion" => Some(json!({"questions": f("questions")})),
+        "ExitPlanMode" => Some(json!({"plan": cut(f("plan"), DETAIL_CHARS * 3)})),
+        _ => None,
+    }
 }
 
 /// 런타임 제한으로 끝난 결과를 사람이 읽을 수 있는 문장으로 (검증: 2.1.304)
@@ -230,6 +315,38 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
                 }));
             }
         }
+        // 글자 단위 스트리밍 (--include-partial-messages). 저장하지 않고 화면에만 보낸다.
+        ("stream_event", _) => {
+            let ev = v.get("event").cloned().unwrap_or(Value::Null);
+            match ev.get("type").and_then(Value::as_str) {
+                Some("content_block_delta") => {
+                    if let Some(t) = ev.pointer("/delta/text").and_then(Value::as_str)
+                        && ev.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+                    {
+                        out.push(Parsed::TextDelta(t.to_string()));
+                    }
+                }
+                Some("content_block_start") => {
+                    match ev.pointer("/content_block/type").and_then(Value::as_str) {
+                        Some("thinking") => out.push(Parsed::Activity("thinking".into())),
+                        Some("tool_use") => out.push(Parsed::Activity(format!(
+                            "tool:{}",
+                            ev.pointer("/content_block/name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                        ))),
+                        Some("text") => out.push(Parsed::Activity("writing".into())),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        ("system", "status") => {
+            if let Some(st) = v.get("status").and_then(Value::as_str) {
+                out.push(Parsed::Activity(st.to_string()));
+            }
+        }
         ("rate_limit_event", _) => {
             if let Some(snapshot) = parse_rate_limit(&v) {
                 out.push(Parsed::RateLimit(snapshot));
@@ -259,6 +376,7 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
                         out.push(Parsed::Event(RunEvent::ToolUse {
                             tool_use_id: str_at(&b, "id").unwrap_or_default(),
                             summary: summarize_tool_input(&name, &input),
+                            input: tool_detail(&name, &input),
                             name,
                         }));
                     }
@@ -313,6 +431,10 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
                     tool_name: str_at(&req, "tool_name").unwrap_or_default(),
                     input: req.get("input").cloned().unwrap_or(Value::Null),
                     description: str_at(&req, "description"),
+                    suggestions: req
+                        .get("permission_suggestions")
+                        .cloned()
+                        .unwrap_or(Value::Null),
                 });
             }
         }
@@ -351,7 +473,8 @@ mod tests {
             Parsed::Event(RunEvent::ToolUse {
                 tool_use_id: "t1".into(),
                 name: "Bash".into(),
-                summary: "ls -la".into()
+                summary: "ls -la".into(),
+                input: Some(json!({"command": "ls -la", "description": "목록"})),
             })
         );
     }
@@ -386,6 +509,7 @@ mod tests {
                 tool_name: "Write".into(),
                 input: json!({"file_path":"/a/b.txt","content":"hi"}),
                 description: Some("b.txt".into()),
+                suggestions: Value::Null,
             }]
         );
     }
@@ -461,6 +585,9 @@ mod tests {
             system_append: String::new(),
             json_schema: None,
             limits: Default::default(),
+            full_settings: false,
+            keep_alive: false,
+            stream_partial: false,
         };
         cfg.limits.max_turns = Some(7);
         cfg.limits.max_budget_usd = Some(0.5);
@@ -484,6 +611,112 @@ mod tests {
                 .contains("7회")
         );
         assert!(describe_error("success", &cfg.limits).is_none());
+    }
+
+    #[test]
+    fn 세션_허용은_영구_규칙을_세션으로_바꾸고_영구_제안은_뺀다() {
+        // 2.1.304 실측 제안
+        let sug = json!([
+            {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch t1.txt"}],"behavior":"allow","destination":"localSettings"},
+            {"type":"addDirectories","directories":["/x"],"destination":"session"},
+            {"type":"setMode","mode":"acceptEdits","destination":"session"},
+            {"type":"addRules","rules":[],"behavior":"allow","destination":"userSettings"},
+            {"type":"setMode","mode":"acceptEdits","destination":"projectSettings"}
+        ]);
+        let out = session_permissions(&sug);
+        assert_eq!(out.len(), 4, "영구 저장 위치의 setMode는 제외: {out:?}");
+        assert!(out.iter().all(|s| s["destination"] == "session"));
+        let v: Value = serde_json::from_str(&encode_allow("r", &json!({"a":1}), &out)).unwrap();
+        assert_eq!(
+            v["response"]["response"]["updatedPermissions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        let once: Value = serde_json::from_str(&encode_allow("r", &json!({}), &[])).unwrap();
+        assert!(
+            once["response"]["response"]
+                .get("updatedPermissions")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn 글자_스트리밍과_진행상태_파싱() {
+        let d = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"안녕"}}}"#;
+        assert_eq!(parse_line(d), vec![Parsed::TextDelta("안녕".into())]);
+        let j = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"a"}}}"#;
+        assert!(
+            parse_line(j).is_empty(),
+            "도구 입력 조각은 저장·전송하지 않음"
+        );
+        let t = r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Edit"}}}"#;
+        assert_eq!(parse_line(t), vec![Parsed::Activity("tool:Edit".into())]);
+        let s = r#"{"type":"system","subtype":"status","status":"requesting"}"#;
+        assert_eq!(parse_line(s), vec![Parsed::Activity("requesting".into())]);
+    }
+
+    #[test]
+    fn 도구_상세는_카드에_필요한_것만_잘라서() {
+        let long = "가".repeat(DETAIL_CHARS + 50);
+        let d = tool_detail(
+            "Edit",
+            &json!({"file_path":"/a.md","old_string":"x","new_string":long}),
+        )
+        .unwrap();
+        assert_eq!(d["filePath"], "/a.md");
+        assert_eq!(
+            d["newString"].as_str().unwrap().chars().count(),
+            DETAIL_CHARS + 1
+        );
+        let todos = json!([{"content":"a","status":"pending","activeForm":"a 중"}]);
+        assert_eq!(
+            tool_detail("TodoWrite", &json!({"todos": todos.clone()})).unwrap()["todos"],
+            todos
+        );
+        assert!(tool_detail("Read", &json!({"file_path":"/a"})).is_none());
+        let ans = with_answers(&json!({"questions":[]}), &json!({"q":"짧게"}));
+        assert_eq!(ans["answers"]["q"], "짧게");
+    }
+
+    #[test]
+    fn 표준_모드는_도구_제한_인자를_넣지_않는다() {
+        let mut cfg = RunConfig {
+            agent_name: "a".into(),
+            agent_role: "r".into(),
+            model: None,
+            effort: None,
+            permission_mode: crate::agent::PermissionMode::Default,
+            tools: vec!["Read".into()],
+            system_append: String::new(),
+            json_schema: None,
+            limits: Default::default(),
+            full_settings: true,
+            keep_alive: true,
+            stream_partial: true,
+        };
+        let args = |cfg: &RunConfig| -> Vec<String> {
+            build_command(
+                std::path::Path::new("claude"),
+                std::path::Path::new("/tmp"),
+                cfg,
+                Session::New("s"),
+            )
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect()
+        };
+        let a = args(&cfg);
+        assert!(
+            !a.contains(&"--strict-mcp-config".to_string()) && !a.contains(&"--tools".to_string())
+        );
+        assert!(a.contains(&"--include-partial-messages".to_string()));
+        cfg.full_settings = false;
+        assert!(args(&cfg).contains(&"--strict-mcp-config".to_string()));
+        let m: Value = serde_json::from_str(&encode_set_mode("m1", "plan")).unwrap();
+        assert_eq!(m["request"]["subtype"], "set_permission_mode");
     }
 
     #[test]

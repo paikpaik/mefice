@@ -529,3 +529,110 @@ pub async fn keep_running_in_background(app: tauri::AppHandle) -> AppResult<()> 
     crate::lifecycle::hide_main(&app);
     Ok(())
 }
+
+// ---------- 대화 (v0.2 A단계 1번) ----------
+
+/// 새 대화를 시작한다. 반환값은 대화 id
+#[tauri::command]
+pub async fn start_chat(
+    db: State<'_, Db>,
+    executor: State<'_, Arc<Executor>>,
+    text: String,
+    options: Option<crate::chat::ChatOptions>,
+) -> AppResult<i64> {
+    let id = {
+        let conn = db.conn()?;
+        let project = current_project(&conn)?;
+        crate::chat::start(&conn, &project, &text, &options.unwrap_or_default())?
+            .0
+            .id
+    };
+    executor.pump();
+    Ok(id)
+}
+
+/// 대화에 메시지를 보낸다. 프로세스가 살아 있으면 그대로 전달, 닫혔으면 세션을 이어서 새 실행
+#[tauri::command]
+pub async fn chat_send(
+    db: State<'_, Db>,
+    executor: State<'_, Arc<Executor>>,
+    chat_id: i64,
+    text: String,
+) -> AppResult<()> {
+    let delivery = {
+        let conn = db.conn()?;
+        let project = current_project(&conn)?;
+        crate::chat::deliver(&conn, &project, chat_id, &text)?
+    };
+    match delivery {
+        crate::chat::Delivery::Queued => executor.pump(),
+        crate::chat::Delivery::SendTo(run_id) => {
+            if executor.send_message(run_id, text.clone()).await.is_err() {
+                // 유휴 종료 직전 등으로 전달 못 하면 세션을 이어서 새 실행
+                {
+                    let conn = db.conn()?;
+                    let project = current_project(&conn)?;
+                    let t = task::get_task(&conn, chat_id)?;
+                    crate::chat::resume_run(&conn, &project, &t, &text)?;
+                }
+                executor.pump();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 현재 응답만 멈춘다 (대화는 유지, Esc)
+#[tauri::command]
+pub async fn chat_interrupt(
+    db: State<'_, Db>,
+    executor: State<'_, Arc<Executor>>,
+    chat_id: i64,
+) -> AppResult<()> {
+    let run = task::latest_run(&*db.conn()?, chat_id)?
+        .filter(|r| !r.status.is_terminal())
+        .ok_or_else(|| AppError::InvalidInput("응답 중이 아닙니다".into()))?;
+    if run.status == task::RunStatus::Queued {
+        return executor.cancel(run.id);
+    }
+    executor.interrupt_turn(run.id)
+}
+
+/// 대화 설정 변경. 모드는 실행 중인 대화에 즉시 적용, 절약 모드·모델은 다음 실행부터
+#[tauri::command]
+pub async fn chat_set_options(
+    db: State<'_, Db>,
+    executor: State<'_, Arc<Executor>>,
+    chat_id: i64,
+    options: crate::chat::ChatOptions,
+) -> AppResult<()> {
+    let live = crate::chat::set_options(&*db.conn()?, chat_id, &options)?;
+    if let Some(run_id) = live {
+        executor.set_mode(run_id, options.permission_mode.as_cli())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_chats(db: State<'_, Db>) -> AppResult<Vec<crate::chat::ChatSummary>> {
+    let conn = db.conn()?;
+    let project = current_project(&conn)?;
+    crate::chat::list(&conn, project.id)
+}
+
+#[tauri::command]
+pub async fn get_chat(db: State<'_, Db>, chat_id: i64) -> AppResult<crate::chat::ChatDetail> {
+    crate::chat::detail(&*db.conn()?, chat_id)
+}
+
+/// 승인·질문·계획에 답한다: allow(이번만) / allow_session(이 세션 동안) / deny
+#[tauri::command]
+pub async fn decide_approval(
+    executor: State<'_, Arc<Executor>>,
+    approval_id: i64,
+    decision: crate::executor::Decision,
+    answers: Option<serde_json::Value>,
+    message: Option<String>,
+) -> AppResult<()> {
+    executor.decide(approval_id, decision, answers, message)
+}

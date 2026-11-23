@@ -30,6 +30,16 @@ pub struct RunConfig {
     /// 실행 제한 (6단계 이전 스냅샷에는 없음)
     #[serde(default)]
     pub limits: crate::agent::Limits,
+    /// 표준 모드: 사용자의 Claude Code 설정(MCP·도구)을 그대로 쓴다 = 터미널과 같은 능력·비용.
+    /// false면 `tools`로 제한하는 절약 모드.
+    #[serde(default)]
+    pub full_settings: bool,
+    /// 대화: 턴이 끝나도 프로세스를 유지하고 다음 메시지를 기다린다
+    #[serde(default)]
+    pub keep_alive: bool,
+    /// 글자 단위 스트리밍 이벤트를 받는다 (`--include-partial-messages`)
+    #[serde(default)]
+    pub stream_partial: bool,
 }
 
 /// 사용량. 런타임이 제공한 값만 채우고, 없으면 None (추정하지 않음).
@@ -107,6 +117,9 @@ pub enum RunEvent {
         tool_use_id: String,
         name: String,
         summary: String,
+        /// 카드 표시용 상세 (diff·할 일·질문·계획). 일부 도구만, 길이 제한
+        #[serde(default)]
+        input: Option<serde_json::Value>,
     },
     /// 도구 결과 (긴 출력은 잘라서 저장, 스펙 5장 "긴 로그 재전달" 방지)
     ToolResult {
@@ -185,9 +198,15 @@ pub enum Parsed {
         tool_name: String,
         input: Value,
         description: Option<String>,
+        /// 런타임의 권한 제안 (세션 허용에 쓴다)
+        suggestions: Value,
     },
     /// 구독 한도 사용률 갱신 (Run 이벤트로 저장하지 않고 앱 전역 상태로 관리)
     RateLimit(RateLimitSnapshot),
+    /// 글자 조각 (저장하지 않고 화면에만 보냄)
+    TextDelta(String),
+    /// 진행 상태: "requesting"(모델 응답 대기), "thinking", "idle" 등 (저장하지 않음)
+    Activity(String),
 }
 
 /// 문자 수 기준으로 자른다 (UTF-8 경계 안전).

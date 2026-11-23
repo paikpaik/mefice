@@ -97,7 +97,7 @@ export interface Agent {
   tools: string[];
   color: string;
   /** pm | worker */
-  kind: "pm" | "worker";
+  kind: "pm" | "worker" | "assistant";
   profile: AgentProfile;
   createdAt: number;
   updatedAt: number;
@@ -151,6 +151,50 @@ export interface OfficeAgent {
   state: OfficeState;
   active: RunRef[];
   last: RunRef | null;
+}
+
+// ---------- 대화 (v0.2 A단계 1번) ----------
+
+export interface ChatOptions {
+  /** 절약 모드: 도구 제한으로 비용 절감 (능력도 줄어듦) */
+  economy: boolean;
+  permissionMode: PermissionMode;
+  model: string | null;
+}
+
+export const defaultChatOptions = (): ChatOptions => ({ economy: false, permissionMode: "default", model: null });
+
+export interface ChatSummary {
+  id: number;
+  title: string;
+  createdAt: number;
+  status: RunStatus | null;
+  updatedAt: number;
+}
+
+export interface ChatDetail {
+  id: number;
+  title: string;
+  options: ChatOptions;
+  run: Run | null;
+  events: StoredEvent[];
+  pending: Approval[];
+}
+
+/** 승인 결정: 이번만 / 이 세션 동안 / 거부 */
+export type Decision = "allow" | "allow_session" | "deny";
+
+export interface RunDelta {
+  runId: number;
+  taskId: number;
+  text: string;
+}
+
+export interface RunActivity {
+  runId: number;
+  taskId: number;
+  /** requesting | thinking | writing | tool:<이름> | idle */
+  activity: string;
 }
 
 /** 종료 확인 창에 보여줄 진행 중 실행 */
@@ -403,11 +447,37 @@ export interface RateLimitSnapshot {
   observedAt: number;
 }
 
+/** 카드 표시용 도구 상세 (일부 도구만, 길이 제한) */
+export interface ToolDetail {
+  filePath?: string;
+  oldString?: string;
+  newString?: string;
+  content?: string;
+  command?: string;
+  description?: string;
+  todos?: Todo[];
+  questions?: AskQuestion[];
+  plan?: string;
+}
+
+export interface Todo {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm: string;
+}
+
+export interface AskQuestion {
+  question: string;
+  header?: string;
+  options: { label: string; description?: string }[];
+  multiSelect?: boolean;
+}
+
 export type RunEventBody =
   | { kind: "started"; sessionId: string; model: string | null; auth?: string | null }
   | { kind: "user_message"; text: string }
   | { kind: "text"; text: string }
-  | { kind: "tool_use"; toolUseId: string; name: string; summary: string }
+  | { kind: "tool_use"; toolUseId: string; name: string; summary: string; input?: ToolDetail | null }
   | { kind: "tool_result"; toolUseId: string; isError: boolean; preview: string; truncated: boolean }
   | { kind: "approval_requested"; approvalId: number; toolName: string; summary: string }
   | { kind: "approval_decided"; approvalId: number; allowed: boolean }
@@ -439,6 +509,8 @@ export interface Approval {
   toolName: string;
   toolInput: unknown;
   description: string | null;
+  /** 런타임 권한 제안 (세션 허용에 사용) */
+  suggestions: unknown;
   status: "pending" | "allowed" | "denied" | "expired";
   createdAt: number;
   decidedAt: number | null;
@@ -452,6 +524,8 @@ export const EVENTS = {
   rateLimitUpdated: "rate-limit-updated",
   pmMessage: "pm-message",
   quitRequested: "quit-requested",
+  runDelta: "run-delta",
+  runActivity: "run-activity",
 } as const;
 
 export const api = {
@@ -491,6 +565,15 @@ export const api = {
   pmSend: (goalId: number | null, text: string) => invoke<number>("pm_send", { goalId, text }),
 
   getTaskDiff: (taskId: number) => invoke<TaskDiff>("get_task_diff", { taskId }),
+  startChat: (text: string, options: ChatOptions) => invoke<number>("start_chat", { text, options }),
+  chatSend: (chatId: number, text: string) => invoke<void>("chat_send", { chatId, text }),
+  chatInterrupt: (chatId: number) => invoke<void>("chat_interrupt", { chatId }),
+  chatSetOptions: (chatId: number, options: ChatOptions) => invoke<void>("chat_set_options", { chatId, options }),
+  listChats: () => invoke<ChatSummary[]>("list_chats"),
+  getChat: (chatId: number) => invoke<ChatDetail>("get_chat", { chatId }),
+  decideApproval: (approvalId: number, decision: Decision, answers?: Record<string, string>, message?: string) =>
+    invoke<void>("decide_approval", { approvalId, decision, answers: answers ?? null, message: message ?? null }),
+
   getActiveRuns: () => invoke<ActiveRunInfo[]>("get_active_runs"),
   confirmQuit: () => invoke<void>("confirm_quit"),
   keepRunningInBackground: () => invoke<void>("keep_running_in_background"),

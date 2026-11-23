@@ -29,7 +29,12 @@ export function Team() {
   const [editing, setEditing] = useState<Editing | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const load = () => api.listAgents().then(setAgents).catch((e) => setError(errorMessage(e)));
+  // 대화용 어시스턴트는 팀원이 아니다
+  const load = () =>
+    api
+      .listAgents()
+      .then((all) => setAgents(all.filter((a) => (a.kind as string) !== "assistant")))
+      .catch((e) => setError(errorMessage(e)));
   useEffect(() => {
     load();
     api.listTemplates().then(setCatalog).catch((e) => setError(errorMessage(e)));

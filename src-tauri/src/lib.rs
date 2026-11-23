@@ -1,6 +1,7 @@
 mod agent;
 #[cfg(test)]
 mod bench;
+mod chat;
 mod commands;
 mod db;
 mod env_check;
@@ -100,6 +101,13 @@ pub fn run() {
             commands::get_active_runs,
             commands::confirm_quit,
             commands::keep_running_in_background,
+            commands::start_chat,
+            commands::chat_send,
+            commands::chat_interrupt,
+            commands::chat_set_options,
+            commands::list_chats,
+            commands::get_chat,
+            commands::decide_approval,
         ])
         .build(tauri::generate_context!())
         .expect("Mefice 실행 중 오류가 발생했습니다")
@@ -191,6 +199,9 @@ mod restore_tests {
                 system_append: String::new(),
                 json_schema: None,
                 limits: Default::default(),
+                full_settings: false,
+                keep_alive: false,
+                stream_partial: false,
             };
             let mk = |prompt: &str| {
                 let t = task::create_task(&conn, p.id, a.id, prompt).unwrap();
@@ -330,6 +341,9 @@ mod restore_tests {
             system_append: String::new(),
             json_schema: None,
             limits: Default::default(),
+            full_settings: false,
+            keep_alive: false,
+            stream_partial: false,
         };
         let mk = |session: &str, pid: u32| {
             let t = task::create_task(&conn, p.id, a.id, "x").unwrap();

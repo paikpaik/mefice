@@ -179,6 +179,10 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE agents ADD COLUMN profile TEXT NOT NULL DEFAULT '{}';
     "#,
+    // v7: 대화 화면 (A단계 1번) — 승인 요청의 런타임 제안 (세션 허용에 사용)
+    r#"
+    ALTER TABLE approvals ADD COLUMN suggestions TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {

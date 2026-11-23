@@ -206,15 +206,27 @@ pub fn list(conn: &Connection) -> AppResult<Vec<Agent>> {
 
 /// 위임 가능한 팀원 (PM 제외)
 pub fn list_workers(conn: &Connection) -> AppResult<Vec<Agent>> {
-    Ok(list(conn)?.into_iter().filter(|a| !a.is_pm()).collect())
+    Ok(list(conn)?
+        .into_iter()
+        .filter(|a| a.kind == KIND_WORKER)
+        .collect())
 }
 
-/// PM 에이전트를 돌려준다. 없으면 기본 설정으로 만든다 (고용·대기에는 토큰이 들지 않음).
-pub fn ensure_pm(conn: &Connection) -> AppResult<Agent> {
+pub const KIND_WORKER: &str = "worker";
+/// 대화 화면의 기본 상대. 페르소나를 덧붙이지 않아 터미널과 같은 프롬프트로 동작한다.
+pub const KIND_ASSISTANT: &str = "assistant";
+
+fn ensure_special(
+    conn: &Connection,
+    kind: &str,
+    name: &str,
+    role: &str,
+    color: &str,
+) -> AppResult<Agent> {
     let existing: Option<i64> = conn
         .query_row(
-            "SELECT id FROM agents WHERE kind = 'pm' AND archived_at IS NULL ORDER BY id LIMIT 1",
-            [],
+            "SELECT id FROM agents WHERE kind = ?1 AND archived_at IS NULL ORDER BY id LIMIT 1",
+            [kind],
             |r| r.get(0),
         )
         .optional()?;
@@ -224,10 +236,20 @@ pub fn ensure_pm(conn: &Connection) -> AppResult<Agent> {
     let now = now_ms();
     conn.execute(
         "INSERT INTO agents (name, role, instructions, permission_mode, tools, color, kind, created_at, updated_at)
-         VALUES ('PM', 'PM', '', 'default', ?1, '#8a5cf6', 'pm', ?2, ?2)",
-        params![serde_json::to_string(&default_tools())?, now],
+         VALUES (?1, ?2, '', 'default', ?3, ?4, ?5, ?6, ?6)",
+        params![name, role, serde_json::to_string(&default_tools())?, color, kind, now],
     )?;
     get(conn, conn.last_insert_rowid())
+}
+
+/// PM 에이전트를 돌려준다. 없으면 기본 설정으로 만든다 (고용·대기에는 토큰이 들지 않음).
+pub fn ensure_pm(conn: &Connection) -> AppResult<Agent> {
+    ensure_special(conn, KIND_PM, "PM", "PM", "#8a5cf6")
+}
+
+/// 대화용 어시스턴트 (팀 목록·위임 대상·사무실에는 나오지 않음)
+pub fn ensure_assistant(conn: &Connection) -> AppResult<Agent> {
+    ensure_special(conn, KIND_ASSISTANT, "어시스턴트", "대화", "#5a6270")
 }
 
 pub fn get(conn: &Connection, id: i64) -> AppResult<Agent> {
@@ -376,8 +398,10 @@ pub fn update(conn: &Connection, id: i64, input: &AgentInput) -> AppResult<Agent
 
 /// 해고는 보관 처리한다 (과거 작업·실행 이력이 에이전트를 참조하므로 삭제하지 않음).
 pub fn archive(conn: &Connection, id: i64) -> AppResult<()> {
-    if get(conn, id)?.is_pm() {
-        return Err(AppError::InvalidInput("PM은 내보낼 수 없습니다".into()));
+    if get(conn, id)?.kind != KIND_WORKER {
+        return Err(AppError::InvalidInput(
+            "PM·어시스턴트는 내보낼 수 없습니다".into(),
+        ));
     }
     conn.execute(
         "UPDATE agents SET archived_at = ?1 WHERE id = ?2",

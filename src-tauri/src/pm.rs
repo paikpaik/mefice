@@ -139,6 +139,9 @@ pub struct Message {
 pub fn run_config(project: &Project, agent: &Agent) -> RunConfig {
     let mut sys = if agent.is_pm() {
         PM_SYSTEM.to_string()
+    } else if agent.kind == agent::KIND_ASSISTANT {
+        // 대화: 터미널과 같은 프롬프트 (페르소나 없음). 프로젝트 지침만 덧붙인다.
+        String::new()
     } else {
         format!(
             "당신은 Mefice 개발팀의 '{}' 역할 에이전트 '{}'입니다.",
@@ -176,6 +179,9 @@ pub fn run_config(project: &Project, agent: &Agent) -> RunConfig {
         system_append: sys,
         json_schema: agent.is_pm().then(|| PM_SCHEMA.to_string()),
         limits: agent.profile.limits.clone(),
+        full_settings: false,
+        keep_alive: false,
+        stream_partial: false,
     }
 }
 
@@ -986,6 +992,7 @@ mod tests {
                 tool_use_id: "1".into(),
                 name: "Edit".into(),
                 summary: "/p/a.rs".into(),
+                input: None,
             },
         )
         .unwrap();
@@ -996,6 +1003,7 @@ mod tests {
                 tool_use_id: "2".into(),
                 name: "Edit".into(),
                 summary: "/p/a.rs".into(),
+                input: None,
             },
         )
         .unwrap();
@@ -1006,6 +1014,7 @@ mod tests {
                 tool_use_id: "3".into(),
                 name: "Read".into(),
                 summary: "/p/b.rs".into(),
+                input: None,
             },
         )
         .unwrap();

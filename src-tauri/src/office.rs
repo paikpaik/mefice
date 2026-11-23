@@ -89,7 +89,11 @@ pub fn state_of(active: &[RunRef], last: Option<&RunRef>) -> OfficeState {
 
 pub fn office_state(conn: &Connection) -> AppResult<Vec<OfficeAgent>> {
     let mut out = Vec::new();
-    for a in agent::list(conn)? {
+    // 대화용 어시스턴트는 사무실 캐릭터가 아니다
+    for a in agent::list(conn)?
+        .into_iter()
+        .filter(|a| a.kind != agent::KIND_ASSISTANT)
+    {
         let active = run_refs(
             conn,
             "SELECT r.id, r.task_id, t.title, r.status, r.ended_at FROM runs r JOIN tasks t ON t.id = r.task_id

@@ -41,7 +41,7 @@ pub fn active_runs(conn: &rusqlite::Connection) -> AppResult<Vec<ActiveRunInfo>>
     let mut stmt = conn.prepare(
         "SELECT r.id, r.task_id, t.title, a.name, r.status, t.isolation
          FROM runs r JOIN tasks t ON t.id = r.task_id JOIN agents a ON a.id = r.agent_id
-         WHERE r.status IN ('queued','running','waiting_for_input','waiting_for_approval','cancelling')
+         WHERE r.status IN ('queued','running','waiting_for_approval','cancelling')
          ORDER BY r.id",
     )?;
     let rows = stmt.query_map([], |r| {

@@ -372,3 +372,73 @@ button.link { border: none; background: none; padding: 0; color: var(--accent); 
 .modal { width: min(560px, calc(100vw - 32px)); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.25); }
 .modal h2 { margin: 0; font-size: 16px; }
 .modal p { margin: 4px 0; }
+
+/* ---------- v0.2 대화 화면 ---------- */
+.content:has(.chat) { padding: 16px; }
+.chat { display: grid; grid-template-columns: 240px 1fr; gap: 12px; height: 100%; }
+.chat-list { display: flex; flex-direction: column; overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.chat-main { min-height: 0; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.chat-view { display: flex; flex-direction: column; height: 100%; padding: 12px 16px; gap: 8px; }
+.chat-empty { margin: auto; text-align: center; }
+.chat-messages { gap: 10px; }
+.msg-user-row { display: flex; justify-content: flex-end; }
+.msg-assistant { max-width: 100%; line-height: 1.6; }
+.msg-assistant.streaming { opacity: 0.9; }
+.msg-system { align-self: center; font-size: 12px; color: var(--muted); }
+.error-text { color: var(--danger); }
+.activity { padding-left: 2px; animation: fade 1.4s ease-in-out infinite; }
+@keyframes fade { 50% { opacity: 0.4; } }
+.grow { flex: 1; }
+
+/* 마크다운 */
+.md > *:first-child { margin-top: 0; }
+.md > *:last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol { margin: 6px 0; }
+.md h1, .md h2, .md h3 { font-size: 15px; margin: 12px 0 6px; }
+.md code.inline { font-family: ui-monospace, Menlo, monospace; font-size: 12px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+.md table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+.md th, .md td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+.md blockquote { margin: 6px 0; padding-left: 10px; border-left: 3px solid var(--border); color: var(--muted); }
+.code-block { border: 1px solid var(--border); border-radius: 6px; margin: 8px 0; overflow: hidden; }
+.code-head { display: flex; justify-content: space-between; align-items: center; padding: 2px 8px; background: var(--bg); }
+.code-copy { font-size: 11px; padding: 1px 8px; }
+.code-block pre { margin: 0; padding: 10px; overflow: auto; font-size: 12px; line-height: 1.5; }
+
+/* 도구 카드 */
+.tool-card { border: 1px solid var(--border); border-radius: 8px; font-size: 13px; overflow: hidden; }
+.tool-head { width: 100%; display: flex; align-items: center; gap: 8px; border: none; border-radius: 0; background: transparent; text-align: left; padding: 6px 10px; }
+.tool-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+.tool-dot.running { background: var(--info); animation: fade 1s ease-in-out infinite; }
+.tool-dot.done { background: var(--ok); }
+.tool-dot.error { background: var(--danger); }
+.tool-name { font-weight: 600; }
+.tool-target { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
+.tool-body { border-top: 1px solid var(--border); padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.tool-diff, .tool-cmd, .tool-result pre { margin: 0; font-size: 12px; background: var(--bg); border-radius: 6px; padding: 6px 0; overflow: auto; max-height: 320px; }
+.tool-diff div { padding: 0 10px; white-space: pre; }
+.tool-cmd { padding: 6px 10px; white-space: pre-wrap; }
+.tool-result pre { padding: 6px 10px; white-space: pre-wrap; }
+
+/* 요청 카드 */
+.req-card { border: 1px solid var(--warn); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.req-card.question { border-color: var(--info); }
+.req-card.plan { border-color: var(--accent); }
+.req-title { font-weight: 600; }
+.req-detail { margin: 0; background: var(--bg); padding: 6px 10px; border-radius: 6px; white-space: pre-wrap; max-height: 160px; overflow: auto; font-size: 12px; }
+.q-block { display: flex; flex-direction: column; gap: 6px; }
+.q-options { display: flex; flex-direction: column; gap: 6px; }
+.q-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
+.q-opt.active { border-color: var(--info); box-shadow: inset 0 0 0 1px var(--info); }
+.plan-body { max-height: 320px; overflow: auto; background: var(--bg); border-radius: 6px; padding: 8px 12px; }
+
+/* 할 일 · 입력창 */
+.todo-panel { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
+.todo { display: flex; gap: 6px; }
+.todo.completed { color: var(--muted); text-decoration: line-through; }
+.todo.in_progress { font-weight: 600; }
+.todo-mark { width: 14px; text-align: center; }
+.chat-composer textarea { resize: none; }
+.composer-bar { flex-wrap: wrap; }
+/* 높이가 제한된 세로 flex 안에서 overflow:hidden 카드가 찌그러지지 않게 (최소 높이가 0이 되는 문제) */
+.chat-messages > * { flex-shrink: 0; }
+.q-block > .badge { align-self: flex-start; }

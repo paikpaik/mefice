@@ -39,17 +39,35 @@ pub const EVENT_USAGE_UPDATED: &str = "usage-updated";
 pub const EVENT_RATE_LIMIT: &str = "rate-limit-updated";
 /// PM 대화 메시지 추가 (payload: pm::Message)
 pub const EVENT_PM_MESSAGE: &str = "pm-message";
+/// 글자 조각 (저장하지 않음, payload: {runId, taskId, text})
+pub const EVENT_RUN_DELTA: &str = "run-delta";
+/// 진행 상태 (저장하지 않음, payload: {runId, taskId, activity})
+pub const EVENT_RUN_ACTIVITY: &str = "run-activity";
 
 /// 실행 중인 Run에 보내는 제어 메시지
 enum Control {
     UserMessage(String, oneshot::Sender<AppResult<()>>),
-    Permission {
-        request_id: String,
-        allow: bool,
-        input: Value,
-    },
+    /// 승인 응답 (인코딩된 한 줄)
+    Permission(String),
+    /// Run 종료 (중단)
     Cancel,
+    /// 현재 턴만 멈춘다. 대화 프로세스는 유지 (Esc)
+    Interrupt,
+    /// 대화 중 모드 전환 (default | acceptEdits | plan)
+    SetMode(String),
 }
+
+/// 승인 결정 (스펙 A단계 1번: 이번만 / 이 세션 동안 / 거부)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Allow,
+    AllowSession,
+    Deny,
+}
+
+/// 대화가 입력 없이 이만큼 지나면 프로세스를 닫는다 (다음 메시지는 세션을 이어서 새 Run)
+const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 struct Outcome {
     status: RunStatus,
@@ -282,6 +300,29 @@ impl<R: Runtime> Executor<R> {
     }
 
     pub fn respond_approval(&self, approval_id: i64, allow: bool) -> AppResult<()> {
+        self.decide(
+            approval_id,
+            if allow {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            },
+            None,
+            None,
+        )
+    }
+
+    /// 승인·질문·계획 요청에 답한다.
+    /// - `answers`: 질문 도구 답 ({질문: 답})
+    /// - `message`: 거부 사유 (런타임에 전달되어 다음 행동에 반영)
+    pub fn decide(
+        &self,
+        approval_id: i64,
+        decision: Decision,
+        answers: Option<Value>,
+        message: Option<String>,
+    ) -> AppResult<()> {
+        let allow = decision != Decision::Deny;
         let approval = {
             let conn = self.db().conn()?;
             let ap = task::get_approval(&conn, approval_id)?;
@@ -292,14 +333,31 @@ impl<R: Runtime> Executor<R> {
             }
             ap
         };
+        let line = match decision {
+            Decision::Deny => claude_code::encode_deny(
+                &approval.request_id,
+                message
+                    .as_deref()
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or("사용자가 거부했습니다."),
+            ),
+            _ => {
+                let input = match &answers {
+                    Some(a) => claude_code::with_answers(&approval.tool_input, a),
+                    None => approval.tool_input.clone(),
+                };
+                let perms = if decision == Decision::AllowSession {
+                    claude_code::session_permissions(&approval.suggestions)
+                } else {
+                    vec![]
+                };
+                claude_code::encode_allow(&approval.request_id, &input, &perms)
+            }
+        };
         let tx = self
             .sender(approval.run_id)
             .ok_or_else(|| AppError::InvalidInput("실행이 이미 끝났습니다".into()))?;
-        let _ = tx.send(Control::Permission {
-            request_id: approval.request_id.clone(),
-            allow,
-            input: approval.tool_input.clone(),
-        });
+        let _ = tx.send(Control::Permission(line));
         self.record(
             approval.run_id,
             RunEvent::ApprovalDecided {
@@ -316,6 +374,23 @@ impl<R: Runtime> Executor<R> {
         };
         if resume {
             self.set_status(approval.run_id, RunStatus::Running);
+        }
+        Ok(())
+    }
+
+    /// 대화: 현재 턴만 멈춘다 (프로세스 유지)
+    pub fn interrupt_turn(&self, run_id: i64) -> AppResult<()> {
+        let tx = self
+            .sender(run_id)
+            .ok_or_else(|| AppError::InvalidInput("실행 중이 아닙니다".into()))?;
+        let _ = tx.send(Control::Interrupt);
+        Ok(())
+    }
+
+    /// 대화: 실행 중인 프로세스의 모드를 바꾼다
+    pub fn set_mode(&self, run_id: i64, mode: &str) -> AppResult<()> {
+        if let Some(tx) = self.sender(run_id) {
+            let _ = tx.send(Control::SetMode(mode.to_string()));
         }
         Ok(())
     }
@@ -364,6 +439,13 @@ impl<R: Runtime> Executor<R> {
         self.notify_run(run_id);
         self.after_run_finished(run_id).await;
         self.pump();
+    }
+
+    fn emit_activity(&self, task_id: i64, run_id: i64, activity: &str) {
+        let _ = self.app.emit(
+            EVENT_RUN_ACTIVITY,
+            serde_json::json!({"runId": run_id, "taskId": task_id, "activity": activity}),
+        );
     }
 
     pub fn emit_message(&self, msg: &pm::Message) {
@@ -540,6 +622,9 @@ impl<R: Runtime> Executor<R> {
         let mut stderr_open = true;
         let mut stderr_events = 0usize;
         let mut stderr_tail: VecDeque<String> = VecDeque::new();
+        // 대화: 다음 입력을 기다리는 중이면 유휴 종료 시각
+        let mut idle_deadline: Option<Instant> = None;
+        let mut interrupt_seq = 0u32;
 
         loop {
             tokio::select! {
@@ -574,8 +659,15 @@ impl<R: Runtime> Executor<R> {
                                         });
                                         last_result = Some((*is_error, err_text));
                                         if pending_turns == 0 {
-                                            stdin = None; // stdin 닫기 → 런타임 정상 종료
+                                            if config.keep_alive && !cancel_requested && stdin.is_some() {
+                                                // 대화: 프로세스를 유지하고 다음 메시지를 기다린다 (터미널과 같은 동작)
+                                                idle_deadline = Some(Instant::now() + CHAT_IDLE_TIMEOUT);
+                                                self.set_status(run_id, RunStatus::WaitingForInput);
+                                            } else {
+                                                stdin = None; // stdin 닫기 → 런타임 정상 종료
+                                            }
                                         }
+                                        self.emit_activity(run.task_id, run_id, "idle");
                                         if run.role == "pm" && !cancel_requested {
                                             self.after_pm_turn(&run, structured.as_ref(), result.as_deref(), *is_error);
                                         }
@@ -584,13 +676,17 @@ impl<R: Runtime> Executor<R> {
                                 }
                                 self.record(run_id, ev);
                             }
-                            Parsed::PermissionRequest { request_id, tool_name, input, description } => {
+                            Parsed::TextDelta(text) => {
+                                let _ = self.app.emit(EVENT_RUN_DELTA, serde_json::json!({"runId": run_id, "taskId": run.task_id, "text": text}));
+                            }
+                            Parsed::Activity(a) => self.emit_activity(run.task_id, run_id, &a),
+                            Parsed::PermissionRequest { request_id, tool_name, input, description, suggestions } => {
                                 if cancel_requested {
                                     write_line(&mut stdin, &claude_code::encode_permission_response(&request_id, false, &input)).await;
                                     continue;
                                 }
                                 let created = self.db().conn().and_then(|c| task::create_approval(
-                                    &c, run_id, &request_id, &tool_name, &input, description.as_deref(),
+                                    &c, run_id, &request_id, &tool_name, &input, description.as_deref(), &suggestions,
                                 ));
                                 match created {
                                     Ok(ap) => {
@@ -640,14 +736,32 @@ impl<R: Runtime> Executor<R> {
                             } else if write_line(&mut stdin, &claude_code::encode_user_message(&text)).await {
                                 pending_turns += 1;
                                 self.record(run_id, RunEvent::UserMessage { text });
+                                if idle_deadline.take().is_some() {
+                                    self.set_status(run_id, RunStatus::Running);
+                                }
                                 let _ = reply.send(Ok(()));
                             } else {
                                 let _ = reply.send(Err(AppError::Internal("런타임에 메시지를 전달하지 못했습니다".into())));
                             }
                         }
-                        Some(Control::Permission { request_id, allow, input }) => {
-                            write_line(&mut stdin, &claude_code::encode_permission_response(&request_id, allow, &input)).await;
+                        Some(Control::Permission(line)) => {
+                            write_line(&mut stdin, &line).await;
                         }
+                        Some(Control::Interrupt) if !cancel_requested && idle_deadline.is_none() => {
+                            // 턴만 멈춘다: 대기 승인은 거부로 답하고 interrupt를 보낸다. stdin은 유지 → 턴 결과 후 입력 대기
+                            let pending = self.db().conn().and_then(|c| task::pending_approvals(&c, run_id)).unwrap_or_default();
+                            for ap in pending {
+                                if let Ok(c) = self.db().conn() { let _ = task::decide_approval(&c, ap.id, false); }
+                                write_line(&mut stdin, &claude_code::encode_deny(&ap.request_id, "사용자가 응답을 멈췄습니다.")).await;
+                            }
+                            interrupt_seq += 1;
+                            write_line(&mut stdin, &claude_code::encode_interrupt(&format!("mefice-turn-{interrupt_seq}"))).await;
+                            self.record(run_id, RunEvent::Notice { text: "응답을 멈췄습니다".into() });
+                        }
+                        Some(Control::SetMode(mode)) => {
+                            write_line(&mut stdin, &claude_code::encode_set_mode(&format!("mefice-mode-{mode}"), &mode)).await;
+                        }
+                        Some(Control::Interrupt) => {}
                         Some(Control::Cancel) if !cancel_requested => {
                             cancel_requested = true;
                             self.set_status(run_id, RunStatus::Cancelling);
@@ -675,6 +789,11 @@ impl<R: Runtime> Executor<R> {
                     if let Some(tx) = self.sender(run_id) {
                         let _ = tx.send(Control::Cancel);
                     }
+                }
+                _ = tokio::time::sleep_until(idle_deadline.unwrap_or_else(Instant::now)), if idle_deadline.is_some() => {
+                    // 대화가 오래 쉬면 프로세스를 닫는다. 다음 메시지는 같은 세션을 이어서 새 Run으로 시작
+                    idle_deadline = None;
+                    stdin = None;
                 }
                 _ = tokio::time::sleep_until(kill_deadline.unwrap_or_else(Instant::now)), if kill_deadline.is_some() => {
                     kill_deadline = None;
@@ -1538,5 +1657,164 @@ mod live_tests {
             .unwrap();
         assert_eq!(run, "interrupted");
         println!("복구 후: 런타임 종료, 실행 상태 {run}");
+    }
+
+    /// v0.2 A단계 1번: 대화 화면의 핵심 흐름을 실제 CLI(표준 모드 = 사용자 설정 그대로)로 검증한다.
+    #[test]
+    #[ignore]
+    fn live_대화_흐름() {
+        use crate::chat::{self, ChatOptions};
+        use tauri::Listener;
+
+        let (env, _agent) = setup(PermissionMode::Default);
+        let deltas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d2 = deltas.clone();
+        env.handle.listen_any(EVENT_RUN_DELTA, move |_| {
+            d2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let conn_of = || env.handle.state::<Db>().inner().conn().unwrap();
+        let proj = || {
+            let c = conn_of();
+            let pid = settings::current_project_id(&c).unwrap().unwrap();
+            project::get(&c, pid).unwrap().unwrap()
+        };
+
+        tauri::async_runtime::block_on(async {
+            let opts = ChatOptions {
+                model: Some("haiku".into()),
+                ..Default::default()
+            };
+            let (chat_id, r1) = {
+                let p = proj();
+                let c = conn_of();
+                let (t, r) = chat::start(&c, &p, "숫자 하나만 답해: 2+3", &opts).unwrap();
+                (t.id, r.id)
+            };
+            env.exec.pump();
+            let idle = |r: &task::Run| r.status == RunStatus::WaitingForInput;
+            wait_until(&env, r1, 120, idle).await;
+            assert!(
+                deltas.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "글자 조각이 와야 함"
+            );
+
+            // 1) 두 번째 메시지는 같은 프로세스로
+            env.exec
+                .send_message(r1, "방금 답에 10을 더한 숫자만 답해".into())
+                .await
+                .unwrap();
+            wait_until(&env, r1, 120, |r| r.status == RunStatus::Running).await;
+            wait_until(&env, r1, 120, idle).await;
+            assert_eq!(
+                task::list_runs(&conn_of(), chat_id).unwrap().len(),
+                1,
+                "같은 Run(프로세스) 유지"
+            );
+
+            // 2) 응답 도중 멈추기 → 대화 유지
+            env.exec
+                .send_message(
+                    r1,
+                    "1부터 300까지 한 줄에 하나씩 텍스트로만 출력해. 도구는 쓰지 마.".into(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            env.exec.interrupt_turn(r1).unwrap();
+            wait_until(&env, r1, 60, idle).await;
+
+            // 3) 세션 허용: 같은 명령은 다시 묻지 않고, 사용자 폴더에 설정 파일이 생기지 않는다
+            env.exec
+                .send_message(r1, "Bash로 'touch s1.txt' 를 실행해.".into())
+                .await
+                .unwrap();
+            wait_until(&env, r1, 120, |r| r.status == RunStatus::WaitingForApproval).await;
+            let ap = task::pending_approvals(&conn_of(), r1).unwrap().remove(0);
+            assert_eq!(ap.tool_name, "Bash");
+            env.exec
+                .decide(ap.id, Decision::AllowSession, None, None)
+                .unwrap();
+            wait_until(&env, r1, 120, idle).await;
+            let asked = || {
+                task::list_events(&conn_of(), r1)
+                    .unwrap()
+                    .iter()
+                    .filter(|e| matches!(e.event, RunEvent::ApprovalRequested { .. }))
+                    .count()
+            };
+            let before = asked();
+            env.exec
+                .send_message(r1, "Bash로 'touch s1.txt' 를 다시 실행해.".into())
+                .await
+                .unwrap();
+            wait_until(&env, r1, 120, |r| r.status == RunStatus::Running).await;
+            wait_until(&env, r1, 120, idle).await;
+            assert_eq!(before, asked(), "세션 허용한 명령은 다시 묻지 않음");
+            assert!(env.proj.path().join("s1.txt").exists());
+            assert!(
+                !env.proj.path().join(".claude").exists(),
+                "사용자 폴더에 영구 규칙 파일이 생기면 안 됨"
+            );
+
+            // 4) 질문 카드
+            env.exec.send_message(r1, "AskUserQuestion 도구로 '빨강'과 '파랑' 중 좋아하는 색을 나에게 물어보고, 내 답을 그대로 한 단어로 말해.".into()).await.unwrap();
+            wait_until(&env, r1, 120, |r| r.status == RunStatus::WaitingForApproval).await;
+            let q = task::pending_approvals(&conn_of(), r1).unwrap().remove(0);
+            assert_eq!(q.tool_name, "AskUserQuestion");
+            let question = q.tool_input["questions"][0]["question"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            env.exec
+                .decide(
+                    q.id,
+                    Decision::Allow,
+                    Some(serde_json::json!({ question: "파랑" })),
+                    None,
+                )
+                .unwrap();
+            wait_until(&env, r1, 120, idle).await;
+            let last_text = task::last_result_text(&conn_of(), r1)
+                .unwrap()
+                .unwrap_or_default();
+            println!("질문 답 반영: {last_text}");
+            assert!(last_text.contains("파랑"));
+
+            // 5) 대화 중 모드 전환 → 자동 수정
+            let edits = ChatOptions {
+                permission_mode: PermissionMode::AcceptEdits,
+                ..opts.clone()
+            };
+            if let Some(run_id) = chat::set_options(&conn_of(), chat_id, &edits).unwrap() {
+                env.exec.set_mode(run_id, "acceptEdits").unwrap();
+            }
+            env.exec
+                .send_message(r1, "Write 도구로 w.txt를 만들고 내용은 w 로 해.".into())
+                .await
+                .unwrap();
+            wait_until(&env, r1, 120, |r| r.status == RunStatus::Running).await;
+            wait_until(&env, r1, 120, idle).await;
+            assert!(env.proj.path().join("w.txt").exists());
+            assert!(task::pending_approvals(&conn_of(), r1).unwrap().is_empty());
+
+            let evs = task::list_events(&conn_of(), r1).unwrap();
+            let detailed = evs
+                .iter()
+                .filter(|e| matches!(&e.event, RunEvent::ToolUse { input: Some(_), .. }))
+                .count();
+            println!(
+                "턴 {} · 도구 상세 저장 {}개 · 글자 조각 {}개",
+                evs.iter()
+                    .filter(|e| matches!(e.event, RunEvent::TurnResult { .. }))
+                    .count(),
+                detailed,
+                deltas.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            assert!(detailed > 0);
+
+            // 정리: 대화 종료
+            env.exec.cancel(r1).unwrap();
+            wait_until(&env, r1, 30, |r| r.status.is_terminal()).await;
+        });
     }
 }

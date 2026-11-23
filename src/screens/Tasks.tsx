@@ -46,7 +46,7 @@ export function Tasks({ onGoTeam, focusTaskId = null, canIsolate }: Props) {
     // 직접 실행 대상에서 PM은 제외 (PM에게는 PM 채팅으로 요청)
     api
       .listAgents()
-      .then((all) => setAgents(all.filter((a) => a.kind !== "pm")))
+      .then((all) => setAgents(all.filter((a) => a.kind === "worker")))
       .catch((e) => setError(errorMessage(e)));
     loadTasks();
     // Run 상태 변경 시 목록의 최신 실행 상태만 갱신. 모르는 작업이면(PM이 새로 위임) 목록을 다시 읽는다.

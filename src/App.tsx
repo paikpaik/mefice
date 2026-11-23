@@ -3,6 +3,7 @@ import { api, errorMessage, type AppSettings, type ProjectView } from "./api";
 import { Welcome } from "./screens/Welcome";
 import { Settings } from "./screens/Settings";
 import { Office } from "./office/Office";
+import { ChatScreen } from "./chat/ChatScreen";
 import { QuitDialog } from "./components/QuitDialog";
 import { Tasks } from "./screens/Tasks";
 import { PmChat } from "./screens/PmChat";
@@ -10,9 +11,10 @@ import { Team } from "./screens/Team";
 import { UsageScreen } from "./screens/UsageScreen";
 import "./styles.css";
 
-type Tab = "office" | "pm" | "board" | "team" | "usage" | "settings";
+type Tab = "chat" | "office" | "pm" | "board" | "team" | "usage" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
+  { id: "chat", label: "대화" },
   { id: "office", label: "사무실" },
   { id: "pm", label: "PM 채팅" },
   { id: "board", label: "작업" },
@@ -26,7 +28,7 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [project, setProject] = useState<ProjectView | null>(null);
-  const [tab, setTab] = useState<Tab>("pm");
+  const [tab, setTab] = useState<Tab>("chat");
   // PM 채팅 등에서 특정 작업으로 이동할 때 사용
   const [focusTask, setFocusTask] = useState<{ id: number; nonce: number } | null>(null);
   const openTask = (id: number) => {
@@ -68,6 +70,7 @@ export default function App() {
         ))}
       </nav>
       <main className="content">
+        {tab === "chat" && <ChatScreen />}
         {tab === "office" && <Office onOpenTask={openTask} onGoTeam={() => setTab("team")} />}
         {tab === "pm" && <PmChat onOpenTask={openTask} onGoTeam={() => setTab("team")} />}
         {tab === "board" && (

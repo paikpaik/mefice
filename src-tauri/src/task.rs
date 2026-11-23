@@ -60,8 +60,8 @@ impl RunStatus {
     }
 }
 
-/// 프로세스가 살아 있어야 하는 상태 (동시 실행 상한 계산 대상)
-const ACTIVE_STATUSES: &str = "'running','waiting_for_input','waiting_for_approval','cancelling'";
+/// 동시 실행 상한 계산 대상. 입력 대기(대화가 다음 메시지를 기다리는 중)는 아무것도 실행하지 않으므로 제외한다.
+const ACTIVE_STATUSES: &str = "'running','waiting_for_approval','cancelling'";
 const NON_TERMINAL_STATUSES: &str =
     "'queued','running','waiting_for_input','waiting_for_approval','cancelling'";
 
@@ -143,6 +143,8 @@ pub struct Approval {
     pub tool_name: String,
     pub tool_input: Value,
     pub description: Option<String>,
+    /// 런타임 권한 제안 (세션 허용 시 변환해 전달)
+    pub suggestions: Value,
     pub status: String,
     pub created_at: i64,
     pub decided_at: Option<i64>,
@@ -713,6 +715,10 @@ fn approval_from_row(r: &Row) -> rusqlite::Result<Approval> {
         tool_name: r.get("tool_name")?,
         tool_input: serde_json::from_str(&input).unwrap_or(Value::Null),
         description: r.get("description")?,
+        suggestions: r
+            .get::<_, Option<String>>("suggestions")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Null),
         status: r.get("status")?,
         created_at: r.get("created_at")?,
         decided_at: r.get("decided_at")?,
@@ -726,17 +732,19 @@ pub fn create_approval(
     tool_name: &str,
     input: &Value,
     description: Option<&str>,
+    suggestions: &Value,
 ) -> AppResult<Approval> {
     conn.execute(
-        "INSERT INTO approvals (run_id, request_id, tool_name, tool_input, description, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO approvals (run_id, request_id, tool_name, tool_input, description, created_at, suggestions)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             run_id,
             request_id,
             tool_name,
             input.to_string(),
             description,
-            now_ms()
+            now_ms(),
+            (!suggestions.is_null()).then(|| suggestions.to_string())
         ],
     )?;
     get_approval(conn, conn.last_insert_rowid())
@@ -802,6 +810,9 @@ mod tests {
             system_append: String::new(),
             json_schema: None,
             limits: Default::default(),
+            full_settings: false,
+            keep_alive: false,
+            stream_partial: false,
         };
         (p.id, a.id, cfg)
     }
@@ -856,8 +867,16 @@ mod tests {
         let e2 = append_event(&conn, r.id, &RunEvent::Text { text: "b".into() }).unwrap();
         assert_eq!((e1.seq, e2.seq), (1, 2));
 
-        let ap =
-            create_approval(&conn, r.id, "req", "Write", &serde_json::json!({}), None).unwrap();
+        let ap = create_approval(
+            &conn,
+            r.id,
+            "req",
+            "Write",
+            &serde_json::json!({}),
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
         assert_eq!(count_active_runs(&conn).unwrap(), 1);
 
         // 앱 재시작 시뮬레이션

@@ -378,6 +378,9 @@ mod tests {
             system_append: String::new(),
             json_schema: None,
             limits: Default::default(),
+            full_settings: false,
+            keep_alive: false,
+            stream_partial: false,
         };
         let t = task::create_task(conn, p.id, a.id, "x").unwrap();
         let mk = |resume| {
