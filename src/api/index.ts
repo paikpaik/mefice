@@ -181,6 +181,18 @@ export interface ChatDetail {
   pending: Approval[];
 }
 
+/** 메시지 첨부 이미지 (base64) */
+export interface ImageAttachment {
+  mediaType: string;
+  data: string;
+}
+
+export interface SlashCommand {
+  name: string;
+  description: string;
+  argumentHint: string;
+}
+
 /** 승인 결정: 이번만 / 이 세션 동안 / 거부 */
 export type Decision = "allow" | "allow_session" | "deny";
 
@@ -475,7 +487,7 @@ export interface AskQuestion {
 
 export type RunEventBody =
   | { kind: "started"; sessionId: string; model: string | null; auth?: string | null }
-  | { kind: "user_message"; text: string }
+  | { kind: "user_message"; text: string; images?: number }
   | { kind: "text"; text: string }
   | { kind: "tool_use"; toolUseId: string; name: string; summary: string; input?: ToolDetail | null }
   | { kind: "tool_result"; toolUseId: string; isError: boolean; preview: string; truncated: boolean }
@@ -491,7 +503,11 @@ export type RunEventBody =
       durationMs: number | null;
       numTurns: number | null;
       sessionTotals?: SessionTotals | null;
+      /** 직전 모델 호출의 컨텍스트 크기 */
+      contextTokens?: number | null;
+      contextWindow?: number | null;
     }
+  | { kind: "compacted"; preTokens: number | null; postTokens: number | null }
   | { kind: "stderr"; text: string }
   | { kind: "notice"; text: string };
 
@@ -526,6 +542,7 @@ export const EVENTS = {
   quitRequested: "quit-requested",
   runDelta: "run-delta",
   runActivity: "run-activity",
+  runtimeCommands: "runtime-commands",
 } as const;
 
 export const api = {
@@ -565,8 +582,12 @@ export const api = {
   pmSend: (goalId: number | null, text: string) => invoke<number>("pm_send", { goalId, text }),
 
   getTaskDiff: (taskId: number) => invoke<TaskDiff>("get_task_diff", { taskId }),
-  startChat: (text: string, options: ChatOptions) => invoke<number>("start_chat", { text, options }),
-  chatSend: (chatId: number, text: string) => invoke<void>("chat_send", { chatId, text }),
+  startChat: (text: string, options: ChatOptions, images: ImageAttachment[] = []) =>
+    invoke<number>("start_chat", { text, options, images }),
+  chatSend: (chatId: number, text: string, images: ImageAttachment[] = []) =>
+    invoke<void>("chat_send", { chatId, text, images }),
+  searchProjectFiles: (query: string) => invoke<string[]>("search_project_files", { query }),
+  getSlashCommands: () => invoke<SlashCommand[]>("get_slash_commands"),
   chatInterrupt: (chatId: number) => invoke<void>("chat_interrupt", { chatId }),
   chatSetOptions: (chatId: number, options: ChatOptions) => invoke<void>("chat_set_options", { chatId, options }),
   listChats: () => invoke<ChatSummary[]>("list_chats"),

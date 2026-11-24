@@ -13,7 +13,7 @@ use crate::agent::{self, PermissionMode};
 use crate::error::{AppError, AppResult};
 use crate::pm;
 use crate::project::Project;
-use crate::runtime::RunConfig;
+use crate::runtime::{ImageAttachment, RunConfig, validate_images};
 use crate::task::{self, Approval, Run, RunStatus, StoredEvent, Task};
 
 pub const MODE_CHAT: &str = "chat";
@@ -69,12 +69,19 @@ pub fn start(
     project: &Project,
     text: &str,
     opts: &ChatOptions,
+    images: &[ImageAttachment],
 ) -> AppResult<(Task, Run)> {
-    if text.trim().is_empty() {
+    validate_images(images)?;
+    if text.trim().is_empty() && images.is_empty() {
         return Err(AppError::InvalidInput("메시지를 입력하세요".into()));
     }
     let (agent_id, cfg) = config(project, opts, conn)?;
-    let t = task::create_task(conn, project.id, agent_id, text)?;
+    let title_src = if text.trim().is_empty() {
+        "이미지 대화"
+    } else {
+        text
+    };
+    let t = task::create_task(conn, project.id, agent_id, title_src)?;
     conn.execute(
         "UPDATE tasks SET mode = ?1, spec = ?2 WHERE id = ?3",
         rusqlite::params![MODE_CHAT, json!({"chat": opts}).to_string(), t.id],
@@ -92,6 +99,7 @@ pub fn start(
         },
         "worker",
     )?;
+    task::set_run_attachments(conn, run.id, images)?;
     Ok((t, run))
 }
 
@@ -115,10 +123,16 @@ pub fn live_run(conn: &Connection, task_id: i64) -> AppResult<Option<Run>> {
 }
 
 /// 프로세스가 닫힌 대화를 같은 세션으로 이어서 새 Run을 만든다
-pub fn resume_run(conn: &Connection, project: &Project, t: &Task, text: &str) -> AppResult<Run> {
+pub fn resume_run(
+    conn: &Connection,
+    project: &Project,
+    t: &Task,
+    text: &str,
+    images: &[ImageAttachment],
+) -> AppResult<Run> {
     let (agent_id, cfg) = config(project, &options_of(t), conn)?;
     let session = task::latest_run(conn, t.id)?.and_then(|r| r.session_id);
-    task::create_run_with_role(
+    let run = task::create_run_with_role(
         conn,
         task::NewRun {
             task_id: t.id,
@@ -129,7 +143,9 @@ pub fn resume_run(conn: &Connection, project: &Project, t: &Task, text: &str) ->
             cwd: &project.path,
         },
         "worker",
-    )
+    )?;
+    task::set_run_attachments(conn, run.id, images)?;
+    Ok(run)
 }
 
 pub fn deliver(
@@ -137,8 +153,10 @@ pub fn deliver(
     project: &Project,
     task_id: i64,
     text: &str,
+    images: &[ImageAttachment],
 ) -> AppResult<Delivery> {
-    if text.trim().is_empty() {
+    validate_images(images)?;
+    if text.trim().is_empty() && images.is_empty() {
         return Err(AppError::InvalidInput("메시지를 입력하세요".into()));
     }
     let t = task::get_task(conn, task_id)?;
@@ -148,14 +166,14 @@ pub fn deliver(
     match live_run(conn, task_id)? {
         Some(r) => Ok(Delivery::SendTo(r.id)),
         None => {
-            resume_run(conn, project, &t, text)?;
+            resume_run(conn, project, &t, text, images)?;
             Ok(Delivery::Queued)
         }
     }
 }
 
-/// 대화 설정을 저장한다. 살아 있는 Run이 있으면 그 id를 돌려준다 (모드 즉시 전환용).
-/// 절약 모드·모델 변경은 다음 Run부터 적용된다 (실행 중인 프로세스의 도구 구성은 바꿀 수 없음).
+/// 대화 설정을 저장한다. 살아 있는 Run이 있으면 그 id를 돌려준다 (모드·모델 즉시 전환용).
+/// 절약 모드 변경은 다음 Run부터 적용된다 (실행 중인 프로세스의 도구 구성은 바꿀 수 없음).
 pub fn set_options(conn: &Connection, task_id: i64, opts: &ChatOptions) -> AppResult<Option<i64>> {
     conn.execute(
         "UPDATE tasks SET spec = ?1 WHERE id = ?2 AND mode = ?3",
@@ -238,6 +256,88 @@ pub fn detail(conn: &Connection, task_id: i64) -> AppResult<ChatDetail> {
     })
 }
 
+// ---------- @파일 자동완성 ----------
+
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".idea",
+];
+const MAX_WALK: usize = 20_000;
+
+/// 업무 폴더의 파일 목록 (상대 경로). Git 저장소면 .gitignore를 따른다.
+pub fn project_files(root: &std::path::Path) -> Vec<String> {
+    if let Ok(out) = crate::git::run(
+        root,
+        &["ls-files", "--cached", "--others", "--exclude-standard"],
+    ) {
+        return out.lines().map(str::to_string).collect();
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    if !SKIP_DIRS.contains(&name.as_str()) {
+                        stack.push(path);
+                    }
+                }
+                Ok(ft) if ft.is_file() => {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        out.push(rel.to_string_lossy().to_string());
+                    }
+                }
+                _ => {}
+            }
+            if out.len() >= MAX_WALK {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// 검색어로 고른다: 파일 이름이 검색어로 시작 > 파일 이름에 포함 > 경로에 포함, 짧은 경로 우선
+pub fn search_files(files: &[String], query: &str, limit: usize) -> Vec<String> {
+    let q = query.to_lowercase();
+    let mut scored: Vec<(u8, usize, &String)> = files
+        .iter()
+        .filter_map(|f| {
+            let lower = f.to_lowercase();
+            let name = lower.rsplit('/').next().unwrap_or(&lower);
+            let rank = if q.is_empty() || name.starts_with(&q) {
+                0
+            } else if name.contains(&q) {
+                1
+            } else if lower.contains(&q) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, f.len(), f))
+        })
+        .collect();
+    scored.sort();
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, f)| f.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,7 +359,7 @@ mod tests {
             model: Some("haiku".into()),
             ..Default::default()
         };
-        let (t, r) = start(&conn, &p, "안녕\n두 번째 줄", &opts).unwrap();
+        let (t, r) = start(&conn, &p, "안녕\n두 번째 줄", &opts, &[]).unwrap();
         assert_eq!(t.mode, MODE_CHAT);
         assert_eq!(t.title, "안녕");
         assert_eq!(options_of(&t), opts);
@@ -280,24 +380,45 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let conn = db.conn().unwrap();
         let (p, _d) = project(&conn);
-        let (t, r1) = start(&conn, &p, "첫 메시지", &ChatOptions::default()).unwrap();
+        let img = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let (t, r1) = start(
+            &conn,
+            &p,
+            "",
+            &ChatOptions::default(),
+            std::slice::from_ref(&img),
+        )
+        .unwrap();
+        assert_eq!(t.title, "이미지 대화", "이미지만 보내도 대화 시작");
+        assert_eq!(
+            task::take_run_attachments(&conn, r1.id).unwrap(),
+            vec![img.clone()]
+        );
         assert!(
-            deliver(&conn, &p, t.id, "x").is_err(),
+            task::take_run_attachments(&conn, r1.id).unwrap().is_empty(),
+            "꺼낸 뒤에는 비움"
+        );
+        assert!(
+            deliver(&conn, &p, t.id, "x", &[]).is_err(),
             "큐 대기 중에는 거부"
         );
         task::mark_run_started(&conn, r1.id, "sess-1").unwrap();
         task::set_run_status(&conn, r1.id, RunStatus::WaitingForInput).unwrap();
         assert!(
-            matches!(deliver(&conn, &p, t.id, "두 번째").unwrap(), Delivery::SendTo(id) if id == r1.id)
+            matches!(deliver(&conn, &p, t.id, "두 번째", &[]).unwrap(), Delivery::SendTo(id) if id == r1.id)
         );
         task::finish_run(&conn, r1.id, RunStatus::Succeeded, Some(0), None).unwrap();
         assert!(matches!(
-            deliver(&conn, &p, t.id, "세 번째").unwrap(),
+            deliver(&conn, &p, t.id, "세 번째", std::slice::from_ref(&img)).unwrap(),
             Delivery::Queued
         ));
         let r2 = task::latest_run(&conn, t.id).unwrap().unwrap();
         assert_eq!(r2.resume_session_id.as_deref(), Some("sess-1"));
         assert_eq!(r2.prompt, "세 번째");
+        assert_eq!(task::take_run_attachments(&conn, r2.id).unwrap().len(), 1);
         // 설정 변경은 저장되고, 다음 Run에 반영
         let econ = ChatOptions {
             economy: true,
@@ -315,11 +436,48 @@ mod tests {
     }
 
     #[test]
+    fn 파일_목록은_gitignore와_무거운_폴더를_건너뛴다() {
+        let repo = crate::git::test_repo::init();
+        std::fs::write(repo.path().join(".gitignore"), "secret.env\n").unwrap();
+        std::fs::write(repo.path().join("secret.env"), "x").unwrap();
+        std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+        std::fs::write(repo.path().join("docs/report.md"), "x").unwrap();
+        let files = project_files(repo.path());
+        assert!(
+            files.contains(&"docs/report.md".to_string()),
+            "미추적 새 파일 포함"
+        );
+        assert!(!files.iter().any(|f| f == "secret.env"), ".gitignore 반영");
+
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plain.path().join("node_modules/x")).unwrap();
+        std::fs::write(plain.path().join("node_modules/x/a.js"), "x").unwrap();
+        std::fs::write(plain.path().join("회의록.md"), "x").unwrap();
+        assert_eq!(project_files(plain.path()), vec!["회의록.md".to_string()]);
+
+        let list: Vec<String> = [
+            "src/report.ts",
+            "docs/report.md",
+            "README.md",
+            "a/b/reporter.rs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            search_files(&list, "rep", 10),
+            // 둘 다 이름이 검색어로 시작 → 짧은 경로 우선, 경로에만 포함된 것은 뒤
+            vec!["src/report.ts", "docs/report.md", "a/b/reporter.rs"]
+        );
+        assert_eq!(search_files(&list, "", 2).len(), 2);
+    }
+
+    #[test]
     fn 입력_대기_대화는_동시_실행_상한에_세지_않는다() {
         let db = Db::open_in_memory().unwrap();
         let conn = db.conn().unwrap();
         let (p, _d) = project(&conn);
-        let (_, r) = start(&conn, &p, "x", &ChatOptions::default()).unwrap();
+        let (_, r) = start(&conn, &p, "x", &ChatOptions::default(), &[]).unwrap();
         task::mark_run_started(&conn, r.id, "s").unwrap();
         assert_eq!(task::count_active_runs(&conn).unwrap(), 1);
         task::set_run_status(&conn, r.id, RunStatus::WaitingForInput).unwrap();

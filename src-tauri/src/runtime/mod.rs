@@ -107,6 +107,9 @@ pub enum RunEvent {
     /// 사용자가 보낸 메시지 (최초 지시, 추가 지시)
     UserMessage {
         text: String,
+        /// 첨부한 이미지 장수 (이미지 자체는 이벤트에 저장하지 않음)
+        #[serde(default)]
+        images: u32,
     },
     /// 에이전트의 텍스트 출력
     Text {
@@ -158,6 +161,17 @@ pub enum RunEvent {
         /// `--json-schema` 사용 시 검증된 구조화 응답
         #[serde(default)]
         structured: Option<serde_json::Value>,
+        /// 직전 모델 호출의 컨텍스트 크기 (입력 + 캐시 읽기·생성 + 출력)
+        #[serde(default)]
+        context_tokens: Option<u64>,
+        /// 모델의 컨텍스트 창 크기
+        #[serde(default)]
+        context_window: Option<u64>,
+    },
+    /// 대화 압축 (`/compact` 또는 자동). 압축 후 컨텍스트 크기 표시에 쓴다
+    Compacted {
+        pre_tokens: Option<u64>,
+        post_tokens: Option<u64>,
     },
     /// 런타임 stderr (진단용, 일부만 저장)
     Stderr {
@@ -181,6 +195,7 @@ impl RunEvent {
             Self::ApprovalDecided { .. } => "approval_decided",
             Self::PermissionDenied { .. } => "permission_denied",
             Self::TurnResult { .. } => "turn_result",
+            Self::Compacted { .. } => "compacted",
             Self::Stderr { .. } => "stderr",
             Self::Notice { .. } => "notice",
         }
@@ -205,8 +220,59 @@ pub enum Parsed {
     RateLimit(RateLimitSnapshot),
     /// 글자 조각 (저장하지 않고 화면에만 보냄)
     TextDelta(String),
+    /// 런타임이 제공하는 슬래시 명령 목록 (초기화 응답)
+    Commands(Vec<SlashCommand>),
     /// 진행 상태: "requesting"(모델 응답 대기), "thinking", "idle" 등 (저장하지 않음)
     Activity(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub argument_hint: String,
+}
+
+/// 메시지 첨부 이미지
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAttachment {
+    /// image/png, image/jpeg, image/gif, image/webp
+    pub media_type: String,
+    /// base64
+    pub data: String,
+}
+
+pub const MAX_IMAGES: usize = 5;
+/// base64 기준 한 장 상한 (약 3.75MB 원본)
+pub const MAX_IMAGE_B64: usize = 5_000_000;
+
+pub fn validate_images(images: &[ImageAttachment]) -> crate::error::AppResult<()> {
+    if images.len() > MAX_IMAGES {
+        return Err(crate::error::AppError::InvalidInput(format!(
+            "이미지는 한 번에 {MAX_IMAGES}장까지 보낼 수 있습니다"
+        )));
+    }
+    for i in images {
+        if !matches!(
+            i.media_type.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            return Err(crate::error::AppError::InvalidInput(format!(
+                "지원하지 않는 이미지 형식: {}",
+                i.media_type
+            )));
+        }
+        if i.data.len() > MAX_IMAGE_B64 {
+            return Err(crate::error::AppError::InvalidInput(
+                "이미지가 너무 큽니다 (약 3.7MB 이하)".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 문자 수 기준으로 자른다 (UTF-8 경계 안전).

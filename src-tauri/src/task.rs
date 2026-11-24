@@ -568,6 +568,37 @@ pub fn mark_run_started(conn: &Connection, id: i64, session_id: &str) -> AppResu
     Ok(())
 }
 
+/// 큐에서 시작할 Run의 첨부 이미지 저장 (Run 구조체에는 싣지 않는다: 화면 갱신 때마다 전송되므로)
+pub fn set_run_attachments(
+    conn: &Connection,
+    id: i64,
+    images: &[crate::runtime::ImageAttachment],
+) -> AppResult<()> {
+    let v = (!images.is_empty())
+        .then(|| serde_json::to_string(images))
+        .transpose()?;
+    conn.execute(
+        "UPDATE runs SET attachments = ?1 WHERE id = ?2",
+        params![v, id],
+    )?;
+    Ok(())
+}
+
+/// 첨부를 꺼내고 비운다 (런타임에 보낸 뒤 원본을 남기지 않음)
+pub fn take_run_attachments(
+    conn: &Connection,
+    id: i64,
+) -> AppResult<Vec<crate::runtime::ImageAttachment>> {
+    let raw: Option<String> =
+        conn.query_row("SELECT attachments FROM runs WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })?;
+    conn.execute("UPDATE runs SET attachments = NULL WHERE id = ?1", [id])?;
+    Ok(raw
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default())
+}
+
 pub fn set_run_cwd(conn: &Connection, id: i64, cwd: &str) -> AppResult<()> {
     conn.execute("UPDATE runs SET cwd = ?1 WHERE id = ?2", params![cwd, id])?;
     Ok(())

@@ -1030,6 +1030,8 @@ mod tests {
                 num_turns: None,
                 session_totals: None,
                 structured: None,
+                context_tokens: None,
+                context_window: None,
             },
         )
         .unwrap();

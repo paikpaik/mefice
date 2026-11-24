@@ -9,7 +9,6 @@ import {
   type ChatDetail,
   type ChatOptions,
   type ChatSummary,
-  type PermissionMode,
   type Run,
   type RunActivity,
   type RunDelta,
@@ -19,12 +18,8 @@ import {
 import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
 import { RequestCard } from "./RequestCards";
-
-const MODE_LABEL: Record<PermissionMode, string> = {
-  default: "수정 전 확인",
-  acceptEdits: "자동 수정",
-  plan: "계획 먼저",
-};
+import { Composer } from "./Composer";
+import { fmtCost, fmtTokens } from "../components/Usage";
 
 function activityLabel(a: string | null): string | null {
   if (!a || a === "idle") return null;
@@ -69,7 +64,7 @@ export function ChatScreen() {
         {selected === null ? (
           <NewChat onStarted={(id) => { setSelected(id); loadChats(); }} />
         ) : (
-          <ChatView key={selected} chatId={selected} />
+          <ChatView key={selected} chatId={selected} onNewChat={() => setSelected(null)} />
         )}
       </section>
     </div>
@@ -88,20 +83,34 @@ function NewChat({ onStarted }: { onStarted: (id: number) => void }) {
         busy={false}
         options={options}
         onOptions={setOptions}
-        onSend={async (text) => onStarted(await api.startChat(text, options))}
+        onSend={async (text, images) => onStarted(await api.startChat(text, options, images))}
       />
     </div>
   );
 }
 
-function ChatView({ chatId }: { chatId: number }) {
+function ChatView({ chatId, onNewChat }: { chatId: number; onNewChat: () => void }) {
   const [detail, setDetail] = useState<ChatDetail | null>(null);
   const [events, setEvents] = useState<StoredEvent[]>([]);
   const [stream, setStream] = useState("");
   const [activity, setActivity] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cost, setCost] = useState<number | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const runIds = useRef<Set<number>>(new Set());
+
+  // 이 대화의 비용 (런타임이 보고한 API 정가 환산값의 합)
+  const loadCost = useCallback(
+    () =>
+      api
+        .getTaskUsage(chatId)
+        .then((rows) => {
+          const vals = rows.map((r) => r.totals.costUsd).filter((c): c is number => c != null);
+          setCost(vals.length ? vals.reduce((a, b) => a + b, 0) : null);
+        })
+        .catch(() => {}),
+    [chatId],
+  );
 
   const load = useCallback(
     () =>
@@ -137,10 +146,14 @@ function ChatView({ chatId }: { chatId: number }) {
     const unAct = listen<RunActivity>(EVENTS.runActivity, ({ payload }) => {
       if (payload.taskId === chatId) setActivity(payload.activity);
     });
+    loadCost();
+    const unUsage = listen<number>(EVENTS.usageUpdated, ({ payload }) => {
+      if (payload === chatId) loadCost();
+    });
     return () => {
-      [unEvent, unRun, unDelta, unAct].forEach((u) => u.then((f) => f()));
+      [unEvent, unRun, unDelta, unAct, unUsage].forEach((u) => u.then((f) => f()));
     };
-  }, [chatId, load]);
+  }, [chatId, load, loadCost]);
 
   useEffect(() => endRef.current?.scrollIntoView({ block: "end" }), [events.length, stream, detail?.pending.length]);
 
@@ -152,6 +165,18 @@ function ChatView({ chatId }: { chatId: number }) {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
       if (e.kind === "tool_use" && e.name === "TodoWrite" && e.input?.todos) return e.input.todos;
+    }
+    return null;
+  }, [events]);
+
+  // 현재 컨텍스트: 마지막 턴의 직전 호출 크기, 그 뒤에 압축했다면 압축 후 크기
+  const context = useMemo(() => {
+    let window: number | null = null;
+    for (const e of events) if (e.kind === "turn_result" && e.contextWindow) window = e.contextWindow;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.kind === "compacted" && e.postTokens != null) return { used: e.postTokens, window };
+      if (e.kind === "turn_result" && e.contextTokens) return { used: e.contextTokens, window };
     }
     return null;
   }, [events]);
@@ -178,8 +203,23 @@ function ChatView({ chatId }: { chatId: number }) {
       {todos && todos.some((t) => t.status !== "completed") && <TodoPanel todos={todos} />}
       {error && <p className="error small">{error}</p>}
 
+      <div className="chat-meter small muted">
+        {context && (
+          <span title="모델이 한 번에 보는 대화 분량입니다. 가득 차면 /compact로 압축하세요.">
+            컨텍스트 {fmtTokens(context.used)}
+            {context.window ? ` / ${fmtTokens(context.window)} (${Math.max(1, Math.round((context.used / context.window) * 100))}%)` : ""}
+          </span>
+        )}
+        {cost != null && (
+          <span title="런타임이 보고한 API 정가 환산값입니다. 구독 로그인이라면 실제 청구액이 아닙니다.">
+            이 대화 {fmtCost(cost)} (정가 환산)
+          </span>
+        )}
+      </div>
+
       <Composer
         busy={busy}
+        onNewChat={onNewChat}
         options={detail.options}
         onOptions={async (o) => {
           setDetail({ ...detail, options: o });
@@ -190,9 +230,9 @@ function ChatView({ chatId }: { chatId: number }) {
           }
         }}
         onStop={() => api.chatInterrupt(chatId).catch((e) => setError(errorMessage(e)))}
-        onSend={async (text) => {
+        onSend={async (text, images) => {
           setError(null);
-          await api.chatSend(chatId, text);
+          await api.chatSend(chatId, text, images);
         }}
       />
     </div>
@@ -212,7 +252,10 @@ function MessageList({ events }: { events: StoredEvent[] }) {
           case "user_message":
             return (
               <div key={key} className="msg-user-row">
-                <div className="msg msg-user">{e.text}</div>
+                <div className="msg msg-user">
+                  {e.images ? <div className="img-chip">이미지 {e.images}장</div> : null}
+                  {e.text}
+                </div>
               </div>
             );
           case "text":
@@ -229,6 +272,15 @@ function MessageList({ events }: { events: StoredEvent[] }) {
             return (
               <div key={key} className="msg-system">
                 허용되지 않은 도구: {e.toolName}
+              </div>
+            );
+          case "compacted":
+            return (
+              <div key={key} className="msg-system">
+                대화를 압축했습니다
+                {e.preTokens != null && e.postTokens != null
+                  ? ` (${e.preTokens.toLocaleString()} → ${e.postTokens.toLocaleString()} 토큰)`
+                  : ""}
               </div>
             );
           case "notice":
@@ -266,94 +318,6 @@ function TodoPanel({ todos }: { todos: Todo[] }) {
           </li>
         ))}
       </ul>
-    </div>
-  );
-}
-
-function Composer({
-  busy,
-  options,
-  onOptions,
-  onSend,
-  onStop,
-}: {
-  busy: boolean;
-  options: ChatOptions;
-  onOptions: (o: ChatOptions) => void;
-  onSend: (text: string) => Promise<void>;
-  onStop?: () => void;
-}) {
-  const [text, setText] = useState("");
-  const [sending, setSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const send = async () => {
-    const t = text.trim();
-    if (!t || sending) return;
-    setSending(true);
-    setError(null);
-    try {
-      await onSend(t);
-      setText("");
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setSending(false);
-    }
-  };
-
-  // Esc: 응답 멈추기
-  useEffect(() => {
-    if (!busy || !onStop) return;
-    const h = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onStop();
-    };
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
-  }, [busy, onStop]);
-
-  return (
-    <div className="composer chat-composer">
-      <textarea
-        rows={3}
-        value={text}
-        placeholder={busy ? "응답 중에도 이어서 보낼 수 있습니다 (Enter 전송, Shift+Enter 줄바꿈)" : "메시지 입력 (Enter 전송, Shift+Enter 줄바꿈)"}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          // 한글 조합 중 Enter는 글자 확정이므로 전송하지 않는다
-          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-            e.preventDefault();
-            send();
-          }
-        }}
-      />
-      <div className="row composer-bar">
-        <select
-          value={options.permissionMode}
-          onChange={(e) => onOptions({ ...options, permissionMode: e.target.value as PermissionMode })}
-          title="수정 전 확인: 파일을 바꾸기 전에 묻습니다 · 자동 수정: 파일 수정은 묻지 않습니다 · 계획 먼저: 계획을 보여주고 승인받은 뒤 실행합니다"
-        >
-          {(Object.keys(MODE_LABEL) as PermissionMode[]).map((m) => (
-            <option key={m} value={m}>
-              {MODE_LABEL[m]}
-            </option>
-          ))}
-        </select>
-        <label className="row small" title="도구를 줄여 비용을 아낍니다 (약 1/3). 웹 조회·외부 연결 등은 쓸 수 없습니다. 다음 실행부터 적용됩니다.">
-          <input type="checkbox" checked={options.economy} onChange={(e) => onOptions({ ...options, economy: e.target.checked })} />
-          절약 모드
-        </label>
-        <span className="grow" />
-        {error && <span className="error small">{error}</span>}
-        {busy && onStop && (
-          <button onClick={onStop} title="Esc">
-            멈추기
-          </button>
-        )}
-        <button className="primary" disabled={!text.trim() || sending} onClick={send}>
-          보내기
-        </button>
-      </div>
     </div>
   );
 }

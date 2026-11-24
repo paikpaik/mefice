@@ -183,6 +183,10 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE approvals ADD COLUMN suggestions TEXT;
     "#,
+    // v8: 대화 보완 (A단계 1-b) — 큐에서 시작할 Run의 첨부 이미지 (보낸 뒤 비움)
+    r#"
+    ALTER TABLE runs ADD COLUMN attachments TEXT;
+    "#,
 ];
 
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {

@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 use super::{
-    Parsed, RateLimitSnapshot, RateLimitWindow, RunConfig, RunEvent, SessionTotals, Usage,
-    truncate_chars,
+    ImageAttachment, Parsed, RateLimitSnapshot, RateLimitWindow, RunConfig, RunEvent,
+    SessionTotals, SlashCommand, Usage, truncate_chars,
 };
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 2000;
@@ -79,13 +79,36 @@ pub fn build_command(bin: &Path, cwd: &Path, cfg: &RunConfig, session: Session) 
     cmd
 }
 
+const INIT_REQUEST_ID: &str = "mefice-init";
+
 pub fn encode_initialize() -> String {
-    json!({"type":"control_request","request_id":"mefice-init","request":{"subtype":"initialize"}})
+    json!({"type":"control_request","request_id":INIT_REQUEST_ID,"request":{"subtype":"initialize"}})
         .to_string()
 }
 
 pub fn encode_user_message(text: &str) -> String {
     json!({"type":"user","message":{"role":"user","content":text}}).to_string()
+}
+
+/// 이미지가 있으면 content를 블록 배열로 보낸다 (실측: 이미지 블록 + 텍스트 블록 인식)
+pub fn encode_user_content(text: &str, images: &[ImageAttachment]) -> String {
+    if images.is_empty() {
+        return encode_user_message(text);
+    }
+    let mut blocks: Vec<Value> = images
+        .iter()
+        .map(|i| json!({"type":"image","source":{"type":"base64","media_type":i.media_type,"data":i.data}}))
+        .collect();
+    if !text.trim().is_empty() {
+        blocks.push(json!({"type":"text","text":text}));
+    }
+    json!({"type":"user","message":{"role":"user","content":blocks}}).to_string()
+}
+
+/// 대화 중 모델 전환 (실측: 즉시 적용)
+pub fn encode_set_model(request_id: &str, model: &str) -> String {
+    json!({"type":"control_request","request_id":request_id,"request":{"subtype":"set_model","model":model}})
+        .to_string()
 }
 
 pub fn encode_interrupt(request_id: &str) -> String {
@@ -246,6 +269,17 @@ fn tool_result_text(content: &Value) -> String {
     }
 }
 
+/// 직전 모델 호출의 컨텍스트 크기 (`usage.iterations` 마지막 항목). 없으면 None.
+fn last_call_tokens(u: &Value) -> Option<u64> {
+    let it = u.get("iterations")?.as_array()?.last()?;
+    let g = |k: &str| u64_at(it, k).unwrap_or(0);
+    let total = g("input_tokens")
+        + g("cache_read_input_tokens")
+        + g("cache_creation_input_tokens")
+        + g("output_tokens");
+    (total > 0).then_some(total)
+}
+
 /// `result.modelUsage`(모델별 세션 누적)를 합산한다. 검증(2.1.304): `--resume` 후에도 누적이 이어진다.
 fn parse_session_totals(v: &Value) -> Option<SessionTotals> {
     let models = v.get("modelUsage")?.as_object()?;
@@ -342,6 +376,27 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
                 _ => {}
             }
         }
+        ("system", "compact_boundary") => {
+            let m = v.get("compact_metadata").cloned().unwrap_or(Value::Null);
+            out.push(Parsed::Event(RunEvent::Compacted {
+                pre_tokens: u64_at(&m, "pre_tokens"),
+                post_tokens: u64_at(&m, "post_tokens"),
+            }));
+        }
+        ("control_response", _) => {
+            // 초기화 응답의 명령 목록 → 슬래시 명령 메뉴
+            if v.pointer("/response/request_id").and_then(Value::as_str) == Some(INIT_REQUEST_ID)
+                && let Some(cmds) = v
+                    .pointer("/response/response/commands")
+                    .and_then(Value::as_array)
+            {
+                let list = cmds
+                    .iter()
+                    .filter_map(|c| serde_json::from_value::<SlashCommand>(c.clone()).ok())
+                    .collect();
+                out.push(Parsed::Commands(list));
+            }
+        }
         ("system", "status") => {
             if let Some(st) = v.get("status").and_then(Value::as_str) {
                 out.push(Parsed::Activity(st.to_string()));
@@ -386,6 +441,21 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
             }
         }
         ("user", _) => {
+            // 로컬 명령 출력 (예: 모델 전환 알림). 압축 출력은 compact_boundary로 따로 알린다.
+            if let Some(s) = v.pointer("/message/content").and_then(Value::as_str)
+                && let Some(rest) = s.strip_prefix("<local-command-stdout>")
+            {
+                let inner = rest
+                    .split("</local-command-stdout>")
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !inner.is_empty() && !inner.starts_with("Compacted") {
+                    out.push(Parsed::Event(RunEvent::Notice {
+                        text: truncate_chars(inner, 300).0,
+                    }));
+                }
+            }
             if let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) {
                 for b in blocks {
                     if b.get("type").and_then(Value::as_str) == Some("tool_result") {
@@ -419,6 +489,11 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
                 num_turns: u64_at(&v, "num_turns"),
                 session_totals: parse_session_totals(&v),
                 structured: v.get("structured_output").filter(|x| !x.is_null()).cloned(),
+                context_tokens: last_call_tokens(&u),
+                context_window: v
+                    .get("modelUsage")
+                    .and_then(Value::as_object)
+                    .and_then(|m| m.values().filter_map(|x| u64_at(x, "contextWindow")).max()),
             }));
         }
         ("control_request", _) => {
@@ -717,6 +792,72 @@ mod tests {
         assert!(args(&cfg).contains(&"--strict-mcp-config".to_string()));
         let m: Value = serde_json::from_str(&encode_set_mode("m1", "plan")).unwrap();
         assert_eq!(m["request"]["subtype"], "set_permission_mode");
+    }
+
+    #[test]
+    fn 압축_명령목록_로컬출력_컨텍스트_파싱() {
+        let c = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":7384,"post_tokens":1205}}"#;
+        assert_eq!(
+            parse_line(c),
+            vec![Parsed::Event(RunEvent::Compacted {
+                pre_tokens: Some(7384),
+                post_tokens: Some(1205)
+            })]
+        );
+        let init = r#"{"type":"control_response","response":{"subtype":"success","request_id":"mefice-init","response":{"commands":[{"name":"compact","description":"대화 압축","argumentHint":""}]}}}"#;
+        match &parse_line(init)[0] {
+            Parsed::Commands(c) => assert_eq!(c[0].name, "compact"),
+            o => panic!("{o:?}"),
+        }
+        let other = r#"{"type":"control_response","response":{"subtype":"success","request_id":"x","response":{"commands":[]}}}"#;
+        assert!(parse_line(other).is_empty());
+        let local = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to `sonnet`</local-command-stdout>"}}"#;
+        assert_eq!(
+            parse_line(local),
+            vec![Parsed::Event(RunEvent::Notice {
+                text: "Set model to `sonnet`".into()
+            })]
+        );
+        let res = r#"{"type":"result","subtype":"success","is_error":false,"usage":{"iterations":[{"input_tokens":2,"cache_read_input_tokens":1947,"cache_creation_input_tokens":4688,"output_tokens":220}]},
+            "modelUsage":{"m":{"contextWindow":1000000}}}"#;
+        match &parse_line(res)[0] {
+            Parsed::Event(RunEvent::TurnResult {
+                context_tokens,
+                context_window,
+                ..
+            }) => {
+                assert_eq!(
+                    (*context_tokens, *context_window),
+                    (Some(6857), Some(1_000_000))
+                );
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn 이미지_메시지와_모델_전환_인코딩() {
+        let img = ImageAttachment {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+        let v: Value =
+            serde_json::from_str(&encode_user_content("색은?", std::slice::from_ref(&img)))
+                .unwrap();
+        let blocks = v["message"]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["text"], "색은?");
+        let plain: Value = serde_json::from_str(&encode_user_content("안녕", &[])).unwrap();
+        assert_eq!(plain["message"]["content"], "안녕");
+        let m: Value = serde_json::from_str(&encode_set_model("m", "sonnet")).unwrap();
+        assert_eq!(m["request"]["subtype"], "set_model");
+        assert!(crate::runtime::validate_images(&vec![img.clone(); 6]).is_err());
+        let bad = ImageAttachment {
+            media_type: "image/bmp".into(),
+            data: "A".into(),
+        };
+        assert!(crate::runtime::validate_images(&[bad]).is_err());
     }
 
     #[test]

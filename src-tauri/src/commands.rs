@@ -539,13 +539,21 @@ pub async fn start_chat(
     executor: State<'_, Arc<Executor>>,
     text: String,
     options: Option<crate::chat::ChatOptions>,
+    images: Option<Vec<crate::runtime::ImageAttachment>>,
 ) -> AppResult<i64> {
     let id = {
         let conn = db.conn()?;
         let project = current_project(&conn)?;
-        crate::chat::start(&conn, &project, &text, &options.unwrap_or_default())?
-            .0
-            .id
+        let images = images.unwrap_or_default();
+        crate::chat::start(
+            &conn,
+            &project,
+            &text,
+            &options.unwrap_or_default(),
+            &images,
+        )?
+        .0
+        .id
     };
     executor.pump();
     Ok(id)
@@ -558,22 +566,28 @@ pub async fn chat_send(
     executor: State<'_, Arc<Executor>>,
     chat_id: i64,
     text: String,
+    images: Option<Vec<crate::runtime::ImageAttachment>>,
 ) -> AppResult<()> {
+    let images = images.unwrap_or_default();
     let delivery = {
         let conn = db.conn()?;
         let project = current_project(&conn)?;
-        crate::chat::deliver(&conn, &project, chat_id, &text)?
+        crate::chat::deliver(&conn, &project, chat_id, &text, &images)?
     };
     match delivery {
         crate::chat::Delivery::Queued => executor.pump(),
         crate::chat::Delivery::SendTo(run_id) => {
-            if executor.send_message(run_id, text.clone()).await.is_err() {
+            if executor
+                .send_message_with(run_id, text.clone(), images.clone())
+                .await
+                .is_err()
+            {
                 // 유휴 종료 직전 등으로 전달 못 하면 세션을 이어서 새 실행
                 {
                     let conn = db.conn()?;
                     let project = current_project(&conn)?;
                     let t = task::get_task(&conn, chat_id)?;
-                    crate::chat::resume_run(&conn, &project, &t, &text)?;
+                    crate::chat::resume_run(&conn, &project, &t, &text, &images)?;
                 }
                 executor.pump();
             }
@@ -606,9 +620,21 @@ pub async fn chat_set_options(
     chat_id: i64,
     options: crate::chat::ChatOptions,
 ) -> AppResult<()> {
-    let live = crate::chat::set_options(&*db.conn()?, chat_id, &options)?;
+    let (before, live) = {
+        let conn = db.conn()?;
+        let before = crate::chat::options_of(&task::get_task(&conn, chat_id)?);
+        (before, crate::chat::set_options(&conn, chat_id, &options)?)
+    };
     if let Some(run_id) = live {
-        executor.set_mode(run_id, options.permission_mode.as_cli())?;
+        if before.permission_mode != options.permission_mode {
+            executor.set_mode(run_id, options.permission_mode.as_cli())?;
+        }
+        // 모델은 실행 중에도 바로 바꾼다 (비우면 다음 실행부터 기본 모델)
+        if before.model != options.model
+            && let Some(m) = options.model.as_deref().filter(|m| !m.trim().is_empty())
+        {
+            executor.set_model(run_id, m)?;
+        }
     }
     Ok(())
 }
@@ -635,4 +661,23 @@ pub async fn decide_approval(
     message: Option<String>,
 ) -> AppResult<()> {
     executor.decide(approval_id, decision, answers, message)
+}
+
+/// `@파일` 자동완성: 업무 폴더 파일 중 검색어에 맞는 것 (최대 30개)
+#[tauri::command]
+pub async fn search_project_files(app: tauri::AppHandle, query: String) -> AppResult<Vec<String>> {
+    with_db_blocking(app, move |c| {
+        let project = current_project(c)?;
+        let files = crate::chat::project_files(std::path::Path::new(&project.path));
+        Ok(crate::chat::search_files(&files, &query, 30))
+    })
+    .await
+}
+
+/// 슬래시 명령 목록 (런타임이 알려준 것. 첫 실행 전에는 빈 목록)
+#[tauri::command]
+pub async fn get_slash_commands(
+    executor: State<'_, Arc<Executor>>,
+) -> AppResult<Vec<crate::runtime::SlashCommand>> {
+    Ok(executor.slash_commands())
 }

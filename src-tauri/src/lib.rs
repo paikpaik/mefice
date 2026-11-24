@@ -108,6 +108,8 @@ pub fn run() {
             commands::list_chats,
             commands::get_chat,
             commands::decide_approval,
+            commands::search_project_files,
+            commands::get_slash_commands,
         ])
         .build(tauri::generate_context!())
         .expect("Mefice 실행 중 오류가 발생했습니다")

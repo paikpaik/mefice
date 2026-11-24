@@ -43,10 +43,16 @@ pub const EVENT_PM_MESSAGE: &str = "pm-message";
 pub const EVENT_RUN_DELTA: &str = "run-delta";
 /// 진행 상태 (저장하지 않음, payload: {runId, taskId, activity})
 pub const EVENT_RUN_ACTIVITY: &str = "run-activity";
+/// 런타임 슬래시 명령 목록 갱신 (payload: SlashCommand[])
+pub const EVENT_COMMANDS: &str = "runtime-commands";
 
 /// 실행 중인 Run에 보내는 제어 메시지
 enum Control {
-    UserMessage(String, oneshot::Sender<AppResult<()>>),
+    UserMessage(
+        String,
+        Vec<crate::runtime::ImageAttachment>,
+        oneshot::Sender<AppResult<()>>,
+    ),
     /// 승인 응답 (인코딩된 한 줄)
     Permission(String),
     /// Run 종료 (중단)
@@ -55,6 +61,8 @@ enum Control {
     Interrupt,
     /// 대화 중 모드 전환 (default | acceptEdits | plan)
     SetMode(String),
+    /// 대화 중 모델 전환
+    SetModel(String),
 }
 
 /// 승인 결정 (스펙 A단계 1번: 이번만 / 이 세션 동안 / 거부)
@@ -91,6 +99,8 @@ pub struct Executor<R: Runtime = Wry> {
     pump_lock: Mutex<()>,
     /// 작업별 worktree 루트 (앱 데이터 폴더 아래, 사용자 레포 밖)
     worktree_root: PathBuf,
+    /// 마지막으로 받은 런타임 슬래시 명령 목록
+    commands: Mutex<Vec<crate::runtime::SlashCommand>>,
 }
 
 impl<R: Runtime> Executor<R> {
@@ -100,6 +110,7 @@ impl<R: Runtime> Executor<R> {
             active: Mutex::new(HashMap::new()),
             pump_lock: Mutex::new(()),
             worktree_root,
+            commands: Mutex::new(Vec::new()),
         })
     }
 
@@ -247,14 +258,37 @@ impl<R: Runtime> Executor<R> {
     // ---------- 외부(명령)에서 호출하는 제어 ----------
 
     pub async fn send_message(&self, run_id: i64, text: String) -> AppResult<()> {
-        if text.trim().is_empty() {
+        self.send_message_with(run_id, text, vec![]).await
+    }
+
+    /// 런타임이 제공하는 슬래시 명령 (처음 실행 전에는 빈 목록)
+    pub fn slash_commands(&self) -> Vec<crate::runtime::SlashCommand> {
+        self.commands.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// 대화: 실행 중인 프로세스의 모델을 바꾼다
+    pub fn set_model(&self, run_id: i64, model: &str) -> AppResult<()> {
+        if let Some(tx) = self.sender(run_id) {
+            let _ = tx.send(Control::SetModel(model.to_string()));
+        }
+        Ok(())
+    }
+
+    pub async fn send_message_with(
+        &self,
+        run_id: i64,
+        text: String,
+        images: Vec<crate::runtime::ImageAttachment>,
+    ) -> AppResult<()> {
+        crate::runtime::validate_images(&images)?;
+        if text.trim().is_empty() && images.is_empty() {
             return Err(AppError::InvalidInput("메시지를 입력하세요".into()));
         }
         let tx = self.sender(run_id).ok_or_else(|| {
             AppError::InvalidInput("실행이 이미 끝났습니다. '이어서 실행'으로 지시하세요".into())
         })?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(Control::UserMessage(text, reply_tx))
+        tx.send(Control::UserMessage(text, images, reply_tx))
             .map_err(|_| AppError::InvalidInput("실행이 이미 끝났습니다".into()))?;
         reply_rx
             .await
@@ -599,14 +633,24 @@ impl<R: Runtime> Executor<R> {
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
         let mut stderr = BufReader::new(child.stderr.take().expect("stderr piped")).lines();
 
+        let images = self
+            .db()
+            .conn()
+            .and_then(|c| task::take_run_attachments(&c, run_id))
+            .unwrap_or_default();
         self.record(
             run_id,
             RunEvent::UserMessage {
                 text: run.prompt.clone(),
+                images: images.len() as u32,
             },
         );
         write_line(&mut stdin, &claude_code::encode_initialize()).await;
-        write_line(&mut stdin, &claude_code::encode_user_message(&run.prompt)).await;
+        write_line(
+            &mut stdin,
+            &claude_code::encode_user_content(&run.prompt, &images),
+        )
+        .await;
 
         let mut current_session = session_id.clone();
         let mut pending_turns: u32 = 1;
@@ -680,6 +724,12 @@ impl<R: Runtime> Executor<R> {
                                 let _ = self.app.emit(EVENT_RUN_DELTA, serde_json::json!({"runId": run_id, "taskId": run.task_id, "text": text}));
                             }
                             Parsed::Activity(a) => self.emit_activity(run.task_id, run_id, &a),
+                            Parsed::Commands(list) => {
+                                if let Ok(mut c) = self.commands.lock() {
+                                    *c = list.clone();
+                                }
+                                let _ = self.app.emit(EVENT_COMMANDS, &list);
+                            }
                             Parsed::PermissionRequest { request_id, tool_name, input, description, suggestions } => {
                                 if cancel_requested {
                                     write_line(&mut stdin, &claude_code::encode_permission_response(&request_id, false, &input)).await;
@@ -730,12 +780,12 @@ impl<R: Runtime> Executor<R> {
                 }
                 ctrl = rx.recv() => {
                     match ctrl {
-                        Some(Control::UserMessage(text, reply)) => {
+                        Some(Control::UserMessage(text, images, reply)) => {
                             if cancel_requested || stdin.is_none() {
                                 let _ = reply.send(Err(AppError::InvalidInput("실행이 끝나는 중입니다. '이어서 실행'으로 지시하세요".into())));
-                            } else if write_line(&mut stdin, &claude_code::encode_user_message(&text)).await {
+                            } else if write_line(&mut stdin, &claude_code::encode_user_content(&text, &images)).await {
                                 pending_turns += 1;
-                                self.record(run_id, RunEvent::UserMessage { text });
+                                self.record(run_id, RunEvent::UserMessage { text, images: images.len() as u32 });
                                 if idle_deadline.take().is_some() {
                                     self.set_status(run_id, RunStatus::Running);
                                 }
@@ -757,6 +807,9 @@ impl<R: Runtime> Executor<R> {
                             interrupt_seq += 1;
                             write_line(&mut stdin, &claude_code::encode_interrupt(&format!("mefice-turn-{interrupt_seq}"))).await;
                             self.record(run_id, RunEvent::Notice { text: "응답을 멈췄습니다".into() });
+                        }
+                        Some(Control::SetModel(model)) => {
+                            write_line(&mut stdin, &claude_code::encode_set_model(&format!("mefice-model-{model}"), &model)).await;
                         }
                         Some(Control::SetMode(mode)) => {
                             write_line(&mut stdin, &claude_code::encode_set_mode(&format!("mefice-mode-{mode}"), &mode)).await;
@@ -1576,11 +1629,38 @@ mod live_tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        // 테스트가 중간에 실패해도 자식(과 그 런타임 트리)을 남기지 않는다
+        struct KillOnDrop(u32);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                crate::sysproc::kill_tree(self.0);
+            }
+        }
+        let _guard = KillOnDrop(child.id());
 
         // 런타임이 sleep 도구 명령을 시작할 때까지 대기
         let deadline = Instant::now() + Duration::from_secs(120);
         let (runtime_pid, session) = loop {
-            assert!(Instant::now() < deadline, "도구 명령이 시작되지 않음");
+            if Instant::now() > deadline {
+                // 진단: 자식 실행이 무엇을 했는지 남긴다
+                if let Ok(db) = Db::open(&db_path) {
+                    let c = db.conn().unwrap();
+                    let runs: Vec<(i64, String, Option<String>)> = c
+                        .prepare("SELECT id, status, error FROM runs")
+                        .unwrap()
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                    eprintln!("[진단] runs: {runs:?}");
+                    for (id, _, _) in &runs {
+                        for e in task::list_events(&c, *id).unwrap() {
+                            eprintln!("[진단] {:?}", e.event);
+                        }
+                    }
+                }
+                panic!("도구 명령이 시작되지 않음");
+            }
             std::thread::sleep(Duration::from_millis(500));
             let Ok(db) = Db::open(&db_path) else { continue };
             let conn = db.conn().unwrap();
@@ -1687,7 +1767,7 @@ mod live_tests {
             let (chat_id, r1) = {
                 let p = proj();
                 let c = conn_of();
-                let (t, r) = chat::start(&c, &p, "숫자 하나만 답해: 2+3", &opts).unwrap();
+                let (t, r) = chat::start(&c, &p, "숫자 하나만 답해: 2+3", &opts, &[]).unwrap();
                 (t.id, r.id)
             };
             env.exec.pump();
@@ -1813,6 +1893,198 @@ mod live_tests {
             assert!(detailed > 0);
 
             // 정리: 대화 종료
+            env.exec.cancel(r1).unwrap();
+            wait_until(&env, r1, 30, |r| r.status.is_terminal()).await;
+        });
+    }
+
+    /// v0.2 A단계 1-b: 이미지 첨부, @파일, 대화 중 모델 전환, /compact, 컨텍스트 수치, 슬래시 명령 목록
+    #[test]
+    #[ignore]
+    fn live_대화_보완기능() {
+        use crate::chat::{self, ChatOptions};
+        use crate::runtime::ImageAttachment;
+
+        let (env, _agent) = setup(PermissionMode::Default);
+        std::fs::create_dir_all(env.proj.path().join("docs")).unwrap();
+        std::fs::write(
+            env.proj.path().join("docs/secret.md"),
+            "비밀 코드는 KIWI-42 입니다.\n",
+        )
+        .unwrap();
+        // 16x16 빨간 PNG (외부 의존 없이 생성)
+        let png = {
+            fn crc(t: &[u8], d: &[u8]) -> u32 {
+                let mut c = 0xffff_ffffu32;
+                for b in t.iter().chain(d) {
+                    c ^= u32::from(*b);
+                    for _ in 0..8 {
+                        c = if c & 1 != 0 {
+                            0xedb8_8320 ^ (c >> 1)
+                        } else {
+                            c >> 1
+                        };
+                    }
+                }
+                !c
+            }
+            fn chunk(out: &mut Vec<u8>, t: &[u8], d: &[u8]) {
+                out.extend((d.len() as u32).to_be_bytes());
+                out.extend(t);
+                out.extend(d);
+                out.extend(crc(t, d).to_be_bytes());
+            }
+            // 행마다 필터 바이트(0) + RGB 16개
+            let row: Vec<u8> = std::iter::once(0u8)
+                .chain([220u8, 30, 30].repeat(16))
+                .collect();
+            let raw: Vec<u8> = row.repeat(16);
+            // 무압축 deflate 블록 (zlib 헤더 + stored block + adler32)
+            let mut z = vec![0x78, 0x01, 0x01];
+            z.extend((raw.len() as u16).to_le_bytes());
+            z.extend((!(raw.len() as u16)).to_le_bytes());
+            z.extend(&raw);
+            let (mut a, mut b) = (1u32, 0u32);
+            for x in &raw {
+                a = (a + u32::from(*x)) % 65521;
+                b = (b + a) % 65521;
+            }
+            z.extend(((b << 16) | a).to_be_bytes());
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            let mut ihdr = Vec::new();
+            ihdr.extend(16u32.to_be_bytes());
+            ihdr.extend(16u32.to_be_bytes());
+            ihdr.extend([8, 2, 0, 0, 0]);
+            chunk(&mut out, b"IHDR", &ihdr);
+            chunk(&mut out, b"IDAT", &z);
+            chunk(&mut out, b"IEND", &[]);
+            out
+        };
+        let b64 = {
+            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut o = String::new();
+            for c in png.chunks(3) {
+                let n = (u32::from(c[0]) << 16)
+                    | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                    | u32::from(*c.get(2).unwrap_or(&0));
+                for i in 0..4 {
+                    o.push(if i <= c.len() {
+                        T[(n >> (18 - 6 * i) & 63) as usize] as char
+                    } else {
+                        '='
+                    });
+                }
+            }
+            o
+        };
+        let conn_of = || env.handle.state::<Db>().inner().conn().unwrap();
+        tauri::async_runtime::block_on(async {
+            let opts = ChatOptions {
+                model: Some("haiku".into()),
+                ..Default::default()
+            };
+            let img = ImageAttachment {
+                media_type: "image/png".into(),
+                data: b64,
+            };
+            let (chat_id, r1) = {
+                let c = conn_of();
+                let pid = settings::current_project_id(&c).unwrap().unwrap();
+                let p = project::get(&c, pid).unwrap().unwrap();
+                let (t, r) = chat::start(
+                    &c,
+                    &p,
+                    "이 이미지의 주된 색을 한 단어로 답해.",
+                    &opts,
+                    &[img],
+                )
+                .unwrap();
+                (t.id, r.id)
+            };
+            env.exec.pump();
+            let idle = |r: &task::Run| r.status == RunStatus::WaitingForInput;
+            wait_until(&env, r1, 120, idle).await;
+            let answer = task::last_result_text(&conn_of(), r1)
+                .unwrap()
+                .unwrap_or_default();
+            println!("1) 이미지 → {answer}");
+            assert!(answer.contains("빨"), "이미지 인식");
+            assert!(
+                task::take_run_attachments(&conn_of(), r1)
+                    .unwrap()
+                    .is_empty(),
+                "보낸 뒤 첨부 원본은 지움"
+            );
+            let ev = task::list_events(&conn_of(), r1).unwrap();
+            assert!(
+                ev.iter()
+                    .any(|e| matches!(e.event, RunEvent::UserMessage { images: 1, .. }))
+            );
+            assert!(
+                !env.exec.slash_commands().is_empty(),
+                "초기화 응답에서 슬래시 명령 목록 수신"
+            );
+
+            env.exec
+                .send_message(
+                    r1,
+                    "@docs/secret.md 에 적힌 비밀 코드만 답해. 도구는 쓰지 마.".into(),
+                )
+                .await
+                .unwrap();
+            wait_until(&env, r1, 120, |r| r.status == RunStatus::Running).await;
+            wait_until(&env, r1, 120, idle).await;
+            let answer = task::last_result_text(&conn_of(), r1)
+                .unwrap()
+                .unwrap_or_default();
+            println!("2) @파일 → {answer}");
+            assert!(answer.contains("KIWI-42"));
+
+            let sonnet = ChatOptions {
+                model: Some("sonnet".into()),
+                ..opts.clone()
+            };
+            chat::set_options(&conn_of(), chat_id, &sonnet).unwrap();
+            env.exec.set_model(r1, "sonnet").unwrap();
+            env.exec
+                .send_message(r1, "지금 쓰는 모델 이름만 답해.".into())
+                .await
+                .unwrap();
+            wait_until(&env, r1, 120, |r| r.status == RunStatus::Running).await;
+            wait_until(&env, r1, 120, idle).await;
+            let answer = task::last_result_text(&conn_of(), r1)
+                .unwrap()
+                .unwrap_or_default();
+            println!("3) 모델 전환 → {answer}");
+            assert!(answer.to_lowercase().contains("sonnet"));
+
+            env.exec.send_message(r1, "/compact".into()).await.unwrap();
+            wait_until(&env, r1, 120, |r| r.status == RunStatus::Running).await;
+            wait_until(&env, r1, 180, idle).await;
+            let ev = task::list_events(&conn_of(), r1).unwrap();
+            let compact = ev.iter().find_map(|e| match &e.event {
+                RunEvent::Compacted {
+                    pre_tokens,
+                    post_tokens,
+                } => Some((*pre_tokens, *post_tokens)),
+                _ => None,
+            });
+            println!("4) /compact → {compact:?}");
+            assert!(compact.is_some());
+            let ctx = ev.iter().rev().find_map(|e| match &e.event {
+                RunEvent::TurnResult {
+                    context_tokens: Some(t),
+                    context_window: Some(w),
+                    ..
+                } => Some((*t, *w)),
+                _ => None,
+            });
+            println!(
+                "5) 컨텍스트 {ctx:?} · 명령 {}개",
+                env.exec.slash_commands().len()
+            );
+            assert!(ctx.is_some_and(|(t, w)| t > 0 && w >= 100_000));
+
             env.exec.cancel(r1).unwrap();
             wait_until(&env, r1, 30, |r| r.status.is_terminal()).await;
         });
