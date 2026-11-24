@@ -460,3 +460,25 @@ button.link { border: none; background: none; padding: 0; color: var(--accent); 
 .icon-btn { font-size: 12px; padding: 4px 10px; }
 .img-chip { font-size: 11px; opacity: 0.85; margin-bottom: 4px; }
 .chat-meter { display: flex; gap: 14px; justify-content: flex-end; min-height: 16px; }
+.checkpoint-line { display: flex; gap: 8px; align-items: center; padding-left: 2px; }
+.req-card.risk-danger { border-color: var(--danger); }
+.req-card details summary { cursor: pointer; }
+.access-options { display: flex; flex-direction: column; gap: 4px; }
+.access-opt { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; }
+.access-opt.active { border-color: var(--accent); }
+.team-group { margin-top: 12px; }
+.team-title { font-size: 13px; color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+
+/* 사장 (A단계 7번) */
+.boss-requests { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.boss-request { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
+.boss-edit { display: flex; flex-direction: column; gap: 8px; }
+button.badge { cursor: pointer; border: none; }
+
+/* 처음 실행 안내 (A단계 8번) */
+.setup-steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 12px; width: min(520px, 100%); text-align: left; }
+.setup-steps li { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; opacity: 0.6; }
+.setup-steps li.current { opacity: 1; border-color: var(--accent); }
+.setup-steps li.done { opacity: 1; }
+.setup-url { word-break: break-all; }
+.setup pre { white-space: pre-wrap; max-width: 520px; }

@@ -2,6 +2,7 @@ mod agent;
 #[cfg(test)]
 mod bench;
 mod chat;
+mod checkpoint;
 mod commands;
 mod db;
 mod env_check;
@@ -9,11 +10,13 @@ mod error;
 mod executor;
 mod git;
 mod lifecycle;
+mod memory;
 mod office;
 mod pm;
 mod project;
 mod runtime;
 mod settings;
+mod setup;
 mod sysproc;
 mod task;
 mod templates;
@@ -110,6 +113,16 @@ pub fn run() {
             commands::decide_approval,
             commands::search_project_files,
             commands::get_slash_commands,
+            commands::restore_checkpoint,
+            commands::set_agent_memory,
+            commands::get_boss,
+            commands::set_boss,
+            commands::get_pending_requests,
+            commands::get_setup_status,
+            commands::install_claude,
+            commands::start_login,
+            commands::submit_login_code,
+            commands::cancel_login,
         ])
         .build(tauri::generate_context!())
         .expect("Mefice 실행 중 오류가 발생했습니다")
@@ -140,6 +153,7 @@ mod restore_tests {
                 &settings::AppSettings {
                     max_concurrency: 4,
                     close_to_tray: false,
+                    dev_mode: false,
                 },
             )
             .unwrap();

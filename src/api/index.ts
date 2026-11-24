@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 export interface AppSettings {
   maxConcurrency: number;
   closeToTray: boolean;
+  /** 개발자 모드: 원래 명령·세부 권한 표시 */
+  devMode: boolean;
 }
 
 export interface GitInfo {
@@ -67,6 +69,8 @@ export interface Limits {
 /** 고용 프로필: 외형·자리·전문 분야·수행 능력·작업 범위·제한 */
 export interface AgentProfile {
   templateId: string | null;
+  /** 소속 팀 */
+  team: string | null;
   avatar: string;
   /** 0부터 시작하는 책상 번호. null이면 자동 배정 */
   desk: number | null;
@@ -78,6 +82,7 @@ export interface AgentProfile {
 
 export const emptyProfile = (): AgentProfile => ({
   templateId: null,
+  team: null,
   avatar: "a",
   desk: null,
   specialties: [],
@@ -99,6 +104,8 @@ export interface Agent {
   /** pm | worker */
   kind: "pm" | "worker" | "assistant";
   profile: AgentProfile;
+  /** 업무 기억 노트 */
+  memory: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -119,6 +126,7 @@ export interface AgentInput {
 
 export interface AgentTemplate {
   id: string;
+  team: string;
   role: string;
   summary: string;
   instructions: string;
@@ -132,6 +140,7 @@ export interface AgentTemplate {
 
 export interface TemplateCatalog {
   templates: AgentTemplate[];
+  teams: string[];
   capabilities: string[];
   deskCount: number;
 }
@@ -508,6 +517,8 @@ export type RunEventBody =
       contextWindow?: number | null;
     }
   | { kind: "compacted"; preTokens: number | null; postTokens: number | null }
+  | { kind: "checkpoint"; checkpointId: number; files: string[]; total: number }
+  | { kind: "restored"; checkpointId: number; restored: number; skipped: string[] }
   | { kind: "stderr"; text: string }
   | { kind: "notice"; text: string };
 
@@ -545,6 +556,37 @@ export const EVENTS = {
   runtimeCommands: "runtime-commands",
 } as const;
 
+/** 처음 실행 안내: AI 실행 도구 설치·로그인 상태 (계정 정보는 담지 않음) */
+export interface SetupStatus {
+  installed: boolean;
+  version: string | null;
+  loggedIn: boolean | null;
+  authMethod: string | null;
+}
+
+export interface LoginProgress {
+  url: string | null;
+  running: boolean;
+  message: string | null;
+}
+
+/** 사장(사용자) 캐릭터 */
+export interface Boss {
+  name: string;
+  avatar: string;
+  color: string;
+}
+
+/** 사장이 답해야 하는 요청 */
+export interface PendingRequest {
+  approvalId: number;
+  toolName: string;
+  taskId: number;
+  taskTitle: string;
+  taskMode: string;
+  agentName: string;
+}
+
 export const api = {
   getAppState: () => invoke<AppState>("get_app_state"),
   openProject: (path: string) => invoke<ProjectView>("open_project", { path }),
@@ -558,6 +600,7 @@ export const api = {
   createAgent: (input: AgentInput) => invoke<Agent>("create_agent", { input }),
   updateAgent: (id: number, input: AgentInput) => invoke<Agent>("update_agent", { id, input }),
   archiveAgent: (id: number) => invoke<void>("archive_agent", { id }),
+  setAgentMemory: (agentId: number, memory: string) => invoke<Agent>("set_agent_memory", { agentId, memory }),
 
   startDirectTask: (agentId: number, prompt: string, isolated: boolean) =>
     invoke<TaskSummary>("start_direct_task", { agentId, prompt, isolated }),
@@ -588,6 +631,9 @@ export const api = {
     invoke<void>("chat_send", { chatId, text, images }),
   searchProjectFiles: (query: string) => invoke<string[]>("search_project_files", { query }),
   getSlashCommands: () => invoke<SlashCommand[]>("get_slash_commands"),
+  /** 대화 응답을 응답 전 상태로 되돌린다 */
+  restoreCheckpoint: (checkpointId: number) =>
+    invoke<{ restored: string[]; skipped: string[] }>("restore_checkpoint", { checkpointId }),
   chatInterrupt: (chatId: number) => invoke<void>("chat_interrupt", { chatId }),
   chatSetOptions: (chatId: number, options: ChatOptions) => invoke<void>("chat_set_options", { chatId, options }),
   listChats: () => invoke<ChatSummary[]>("list_chats"),
@@ -601,6 +647,14 @@ export const api = {
 
   listTemplates: () => invoke<TemplateCatalog>("list_templates"),
   getOfficeState: () => invoke<OfficeAgent[]>("get_office_state"),
+  getSetupStatus: () => invoke<SetupStatus>("get_setup_status"),
+  installClaude: () => invoke<string>("install_claude"),
+  startLogin: () => invoke<LoginProgress>("start_login"),
+  submitLoginCode: (code: string) => invoke<LoginProgress>("submit_login_code", { code }),
+  cancelLogin: () => invoke<void>("cancel_login"),
+  getBoss: () => invoke<Boss>("get_boss"),
+  setBoss: (boss: Boss) => invoke<Boss>("set_boss", { boss }),
+  getPendingRequests: () => invoke<PendingRequest[]>("get_pending_requests"),
   getAgentOverview: (agentId: number) => invoke<AgentOverview>("get_agent_overview", { agentId }),
 
   /** 사용자 현재 브랜치에 병합. 반환값은 병합 커밋 */

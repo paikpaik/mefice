@@ -74,6 +74,7 @@ const PM_SYSTEM: &str = "당신은 Mefice 개발팀의 PM입니다. 사용자의
 - 위임할 때 담당자는 이 대화를 볼 수 없습니다. goal(목표), scope(수정해도 되는 폴더·파일), inputs(필요한 맥락), doneCriteria(검증 가능한 완료 조건)를 구체적으로 씁니다.
 - 각 작업의 paths에 수정할 경로를 적습니다. 수정 범위가 겹치는 작업은 나누지 말고 하나로 합치거나 dependsOn으로 순서를 정합니다. 앞 작업의 결과가 필요한 작업도 dependsOn을 씁니다.
 - 위임 작업은 각자 격리된 작업 공간(git worktree)에서 실행되고, 결과는 사용자가 확인한 뒤 병합합니다. 담당자에게 커밋·브랜치 작업을 시키지 않습니다.
+- 팀원 목록의 [팀] 표시를 보고 분야에 맞는 팀원에게 맡깁니다. 맞는 팀이 없으면 hire로 제안합니다.
 - 팀원 목록에 있는 agentId만 사용합니다.
 - reply는 짧게 씁니다. 결과를 반복하거나 계획을 길게 설명하지 않습니다.";
 
@@ -165,6 +166,14 @@ pub fn run_config(project: &Project, agent: &Agent) -> RunConfig {
         sys.push_str("\n\n## 역할 지침\n");
         sys.push_str(agent.instructions.trim());
     }
+    if agent.kind == agent::KIND_WORKER {
+        if !agent.memory.trim().is_empty() {
+            sys.push_str("\n\n## 내 업무 기억 (이전 작업에서 기록)\n");
+            sys.push_str(agent.memory.trim());
+        }
+        sys.push_str("\n\n");
+        sys.push_str(crate::memory::MEMORY_GUIDE);
+    }
     if !project.instructions.trim().is_empty() {
         sys.push_str("\n\n## 프로젝트 지침\n");
         sys.push_str(project.instructions.trim());
@@ -220,8 +229,13 @@ pub fn team_summary(conn: &Connection) -> AppResult<String> {
                 ));
             }
             format!(
-                "- agentId {}: {} ({}) · 도구 {} · {}{}",
+                "- agentId {}: {}{} ({}) · 도구 {} · {}{}",
                 a.id,
+                a.profile
+                    .team
+                    .as_deref()
+                    .map(|t| format!("[{t}팀] "))
+                    .unwrap_or_default(),
                 a.name,
                 a.role,
                 a.tools.join(","),

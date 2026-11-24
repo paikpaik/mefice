@@ -681,3 +681,71 @@ pub async fn get_slash_commands(
 ) -> AppResult<Vec<crate::runtime::SlashCommand>> {
     Ok(executor.slash_commands())
 }
+
+/// 대화 응답을 응답 전 상태로 되돌린다 (응답 뒤 사용자가 고친 파일은 건너뜀)
+#[tauri::command]
+pub async fn restore_checkpoint(
+    executor: State<'_, Arc<Executor>>,
+    checkpoint_id: i64,
+) -> AppResult<crate::checkpoint::RestoreResult> {
+    executor.restore_checkpoint(checkpoint_id).await
+}
+
+/// 팀원 업무 기억 노트를 고친다 (사장이 직접 편집)
+#[tauri::command]
+pub async fn set_agent_memory(
+    db: State<'_, Db>,
+    agent_id: i64,
+    memory: String,
+) -> AppResult<Agent> {
+    let conn = db.conn()?;
+    crate::memory::set(&conn, agent_id, &memory)?;
+    agent::get(&conn, agent_id)
+}
+
+// ---------- 사장 (A단계 7번) ----------
+
+#[tauri::command]
+pub async fn get_boss(db: State<'_, Db>) -> AppResult<settings::Boss> {
+    settings::load_boss(&*db.conn()?)
+}
+
+#[tauri::command]
+pub async fn set_boss(db: State<'_, Db>, boss: settings::Boss) -> AppResult<settings::Boss> {
+    settings::save_boss(&*db.conn()?, &boss)
+}
+
+/// 사장이 답해야 하는 요청 목록 (사무실 사장 말풍선·목록)
+#[tauri::command]
+pub async fn get_pending_requests(
+    db: State<'_, Db>,
+) -> AppResult<Vec<crate::office::PendingRequest>> {
+    crate::office::pending_requests(&*db.conn()?)
+}
+
+// ---------- 처음 실행 안내 (A단계 8번) ----------
+
+#[tauri::command]
+pub async fn get_setup_status() -> AppResult<crate::setup::SetupStatus> {
+    blocking(crate::setup::status).await
+}
+
+#[tauri::command]
+pub async fn install_claude() -> AppResult<String> {
+    blocking(crate::setup::install).await?
+}
+
+#[tauri::command]
+pub async fn start_login() -> AppResult<crate::setup::LoginProgress> {
+    blocking(crate::setup::start_login).await?
+}
+
+#[tauri::command]
+pub async fn submit_login_code(code: String) -> AppResult<crate::setup::LoginProgress> {
+    blocking(move || crate::setup::submit_login_code(&code)).await?
+}
+
+#[tauri::command]
+pub async fn cancel_login() -> AppResult<()> {
+    blocking(crate::setup::cancel_login).await
+}

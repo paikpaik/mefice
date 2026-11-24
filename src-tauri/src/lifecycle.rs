@@ -151,6 +151,7 @@ pub fn on_run_event(app: &AppHandle, event: RunEvent) {
             request_quit(app);
         }
         RunEvent::Exit => {
+            crate::setup::cancel_login();
             if let Some(exec) = app.try_state::<Arc<Executor>>() {
                 exec.kill_remaining();
             }

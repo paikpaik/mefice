@@ -187,6 +187,25 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE runs ADD COLUMN attachments TEXT;
     "#,
+    // v9: 대화 되돌리기 (A단계 3번) — 응답 전후 기록
+    r#"
+    CREATE TABLE checkpoints (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id       INTEGER NOT NULL REFERENCES tasks(id),
+        run_id        INTEGER NOT NULL REFERENCES runs(id),
+        project_id    INTEGER NOT NULL REFERENCES projects(id),
+        before_commit TEXT    NOT NULL,
+        after_commit  TEXT    NOT NULL,
+        files         TEXT    NOT NULL,
+        created_at    INTEGER NOT NULL,
+        restored_at   INTEGER
+    );
+    CREATE INDEX idx_checkpoints_task ON checkpoints(task_id);
+    "#,
+    // v10: 팀원 업무 기억 (A단계 5번)
+    r#"
+    ALTER TABLE agents ADD COLUMN memory TEXT NOT NULL DEFAULT '';
+    "#,
 ];
 
 pub fn migrate(conn: &mut Connection) -> AppResult<()> {

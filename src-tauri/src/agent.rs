@@ -59,6 +59,8 @@ pub struct Agent {
     /// pm | worker
     pub kind: String,
     pub profile: AgentProfile,
+    /// 업무 기억 노트 (작업 때 시스템 프롬프트에 들어감)
+    pub memory: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -100,6 +102,8 @@ pub struct Limits {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentProfile {
     pub template_id: Option<String>,
+    /// 소속 팀 (개발·문서·법률·디자인·자동화·조사 등)
+    pub team: Option<String>,
     /// 캐릭터 형태 (프론트엔드 스프라이트 변형 id)
     pub avatar: String,
     /// 책상 번호 (0..DESK_COUNT). None이면 고용 시 빈자리 자동 배정
@@ -174,7 +178,7 @@ fn blank_to_none(v: &Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-const COLS: &str = "id, name, role, instructions, model, effort, permission_mode, tools, color, kind, profile, created_at, updated_at";
+const COLS: &str = "id, name, role, instructions, model, effort, permission_mode, tools, color, kind, profile, memory, created_at, updated_at";
 
 fn from_row(r: &Row) -> rusqlite::Result<Agent> {
     let tools: String = r.get("tools")?;
@@ -191,6 +195,7 @@ fn from_row(r: &Row) -> rusqlite::Result<Agent> {
         color: r.get("color")?,
         kind: r.get("kind")?,
         profile: serde_json::from_str(&r.get::<_, String>("profile")?).unwrap_or_default(),
+        memory: r.get("memory")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })

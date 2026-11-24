@@ -51,6 +51,10 @@ export function deskLocation(index: number): Location {
 
 export const PM_LOCATION: Location = seatLocation("desk-pm", PM_DESK, PM_DESK.x - 60);
 
+/** 사장 자리 (PM 자리 아래) */
+export const BOSS_DESK: Point = { x: 920, y: 270 };
+export const BOSS_LOCATION: Location = seatLocation("desk-boss", BOSS_DESK, BOSS_DESK.x - 60);
+
 function spot(id: string, x: number, y: number, sit = false): Location {
   return { id, x, y, sit, approach: [{ x, y: CORRIDOR_Y }, { x, y }] };
 }

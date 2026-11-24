@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, errorMessage, EVENTS, type OfficeAgent } from "../api";
+import { api, errorMessage, EVENTS, type Boss, type OfficeAgent, type PendingRequest } from "../api";
 import { Character, CharacterBubble, type BubbleKind, type Pose } from "./Character";
 import {
+  BOSS_DESK,
+  BOSS_LOCATION,
   DESK_H,
   DESK_W,
   LOUNGE,
@@ -16,6 +18,7 @@ import {
   type Point,
 } from "./layout";
 import { AgentPanel } from "./AgentPanel";
+import { BossPanel } from "./BossPanel";
 
 /** 캐릭터 행동 모드 (스펙 4.5 상태 → 시각 표현) */
 type Mode = "idle" | "wait" | "work" | "ask" | "error" | "done";
@@ -96,14 +99,20 @@ function modeOf(a: OfficeAgent, now: number, dismissed: Set<number>): Mode {
 
 interface Props {
   onOpenTask: (taskId: number) => void;
+  onOpenChat: (chatId: number) => void;
   onGoTeam: () => void;
 }
 
+/** 선택 대상: 팀원 id 또는 사장 */
+type Selection = number | "boss" | null;
+
 /** 사무실 (스펙 4.5). 대기 행동은 모두 로컬 애니메이션이며 모델을 호출하지 않는다. */
-export function Office({ onOpenTask, onGoTeam }: Props) {
+export function Office({ onOpenTask, onOpenChat, onGoTeam }: Props) {
   const [agents, setAgents] = useState<OfficeAgent[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<number | null>(null);
+  const [selected, setSelected] = useState<Selection>(null);
+  const [boss, setBoss] = useState<Boss | null>(null);
+  const [pending, setPending] = useState<PendingRequest[]>([]);
   const [now, setNow] = useState(() => Date.now());
   const [dismissed, setDismissed] = useState<Set<number>>(loadDismissed);
   const [poses, setPoses] = useState<Record<number, { pose: Pose; facing: 1 | -1 }>>({});
@@ -115,10 +124,10 @@ export function Office({ onOpenTask, onGoTeam }: Props) {
 
   const load = useCallback(
     () =>
-      api
-        .getOfficeState()
-        .then((a) => {
+      Promise.all([api.getOfficeState(), api.getPendingRequests()])
+        .then(([a, p]) => {
           setAgents(a);
+          setPending(p);
           setError(null);
         })
         .catch((e) => setError(errorMessage(e))),
@@ -126,6 +135,10 @@ export function Office({ onOpenTask, onGoTeam }: Props) {
   );
 
   // 실행 상태가 바뀔 때만 다시 읽는다 (폴링 없음). 여러 이벤트가 몰리면 한 번으로 묶는다.
+  useEffect(() => {
+    api.getBoss().then(setBoss).catch(() => {});
+  }, []);
+
   useEffect(() => {
     load();
     let timer: number | undefined;
@@ -271,10 +284,16 @@ export function Office({ onOpenTask, onGoTeam }: Props) {
     return c;
   }, [modes]);
   const selectedAgent = agents.find((a) => a.agent.id === selected) ?? null;
+  const openRequest = (r: PendingRequest) => (r.taskMode === "chat" ? onOpenChat(r.taskId) : onOpenTask(r.taskId));
 
   return (
     <div className="office">
       <div className="office-bar row small">
+        {pending.length > 0 && (
+          <button className="badge warn" onClick={() => setSelected("boss")}>
+            사장 확인 필요 {pending.length}
+          </button>
+        )}
         <span>팀원 {workers.length}명</span>
         {(["work", "ask", "wait", "error", "done"] as Mode[]).map(
           (m) =>
@@ -334,8 +353,33 @@ export function Office({ onOpenTask, onGoTeam }: Props) {
               </g>
             );
           })}
+          {boss && (
+            <g
+              transform={`translate(${BOSS_LOCATION.x},${BOSS_LOCATION.y})`}
+              className={`char-wrap ${selected === "boss" ? "selected" : ""}`}
+              onClick={() => setSelected("boss")}
+            >
+              <title>
+                {boss.name} (사장){pending.length ? ` · 답을 기다리는 요청 ${pending.length}건` : ""}
+              </title>
+              <Character color={boss.color} avatar={boss.avatar} pose="sit" badge="사장" />
+              {pending.length > 0 && <CountBubble count={pending.length} />}
+              <text y="16" textAnchor="middle" className="char-name">
+                {boss.name}
+              </text>
+            </g>
+          )}
         </svg>
 
+        {selected === "boss" && boss && (
+          <BossPanel
+            boss={boss}
+            pending={pending}
+            onBossChange={setBoss}
+            onOpen={openRequest}
+            onClose={() => setSelected(null)}
+          />
+        )}
         {selectedAgent && (
           <AgentPanel
             key={selectedAgent.agent.id}
@@ -387,6 +431,14 @@ function Floor({ agents }: { agents: OfficeAgent[] }) {
           PM
         </text>
       </g>
+      {/* 사장 자리 */}
+      <g transform={`translate(${BOSS_DESK.x},${BOSS_DESK.y})`} className="desk boss-desk">
+        <rect x="-60" y={-DESK_H / 2} width="120" height={DESK_H} rx="4" className="desk-top" />
+        <rect x="-16" y="-34" width="32" height="20" rx="2" className="monitor" />
+        <text x="54" y={DESK_H / 2 - 5} textAnchor="end" className="desk-no">
+          사장
+        </text>
+      </g>
       {/* 휴게 공간 가구 */}
       <rect x="62" y="586" width="186" height="26" rx="8" className="sofa" />
       <rect x="62" y="566" width="186" height="14" rx="6" className="sofa back" />
@@ -410,6 +462,20 @@ function Floor({ agents }: { agents: OfficeAgent[] }) {
         <rect x="-12" y="-36" width="24" height="40" rx="4" className="machine" />
         <rect x="-9" y="-48" width="18" height="14" rx="4" className="water" />
       </g>
+    </g>
+  );
+}
+
+/** 사장 머리 위: 답을 기다리는 요청 수 */
+function CountBubble({ count }: { count: number }) {
+  const label = count > 9 ? "9+" : String(count);
+  return (
+    <g className="bubble bubble-question" transform="translate(12,-58)">
+      <rect x="-10" y="-11" width="20" height="16" rx="5" fill="#f5b041" />
+      <path d="M-3,5 L-6,10 L2,5 Z" fill="#f5b041" />
+      <text x="0" y="1" textAnchor="middle" fontSize="10" fontWeight="700" fill="#fff">
+        {label}
+      </text>
     </g>
   );
 }

@@ -119,6 +119,38 @@ pub fn office_state(conn: &Connection) -> AppResult<Vec<OfficeAgent>> {
     Ok(out)
 }
 
+/// 사장이 답해야 하는 요청 (권한·질문·계획)
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRequest {
+    pub approval_id: i64,
+    pub tool_name: String,
+    pub task_id: i64,
+    pub task_title: String,
+    /// chat | pm | delegated | direct — 화면 이동에 쓴다
+    pub task_mode: String,
+    pub agent_name: String,
+}
+
+pub fn pending_requests(conn: &Connection) -> AppResult<Vec<PendingRequest>> {
+    let mut stmt = conn.prepare(
+        "SELECT ap.id, ap.tool_name, t.id, t.title, t.mode, a.name
+         FROM approvals ap JOIN runs r ON r.id = ap.run_id JOIN tasks t ON t.id = r.task_id JOIN agents a ON a.id = r.agent_id
+         WHERE ap.status = 'pending' ORDER BY ap.id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(PendingRequest {
+            approval_id: r.get(0)?,
+            tool_name: r.get(1)?,
+            task_id: r.get(2)?,
+            task_title: r.get(3)?,
+            task_mode: r.get(4)?,
+            agent_name: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentOverview {
@@ -154,6 +186,67 @@ pub fn agent_overview(conn: &Connection, agent_id: i64) -> AppResult<AgentOvervi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 사장_대기요청_목록과_사장_저장() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let conn = db.conn().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = crate::project::upsert(&conn, dir.path()).unwrap();
+        let pm = crate::agent::ensure_pm(&conn).unwrap();
+        let t = crate::task::create_task(&conn, p.id, pm.id, "보고서 정리").unwrap();
+        let cfg = crate::pm::run_config(&p, &pm);
+        let run = crate::task::create_run(
+            &conn,
+            crate::task::NewRun {
+                task_id: t.id,
+                agent_id: pm.id,
+                prompt: "x",
+                resume_session_id: None,
+                config: &cfg,
+                cwd: "/tmp",
+            },
+        )
+        .unwrap();
+        assert!(pending_requests(&conn).unwrap().is_empty());
+        let ap = crate::task::create_approval(
+            &conn,
+            run.id,
+            "r1",
+            "Bash",
+            &serde_json::json!({}),
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        let list = pending_requests(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].approval_id, ap.id);
+        assert_eq!(list[0].task_id, t.id);
+        assert_eq!(list[0].task_mode, "direct");
+
+        let b = crate::settings::load_boss(&conn).unwrap();
+        assert_eq!(b.name, "사장");
+        let saved = crate::settings::save_boss(
+            &conn,
+            &crate::settings::Boss {
+                name: "  ".into(),
+                ..b
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.name, "사장", "빈 이름은 기본값");
+        let saved = crate::settings::save_boss(
+            &conn,
+            &crate::settings::Boss {
+                name: " 지영 ".into(),
+                ..saved
+            },
+        )
+        .unwrap();
+        assert_eq!(crate::settings::load_boss(&conn).unwrap(), saved);
+        assert_eq!(saved.name, "지영");
+    }
 
     fn r(status: RunStatus) -> RunRef {
         RunRef {

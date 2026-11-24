@@ -1,15 +1,7 @@
-import { useState } from "react";
+import { useContext, useState } from "react";
+import { DevModeContext, explain, RISK_LABEL } from "../plain";
 import { api, errorMessage, type Approval, type AskQuestion, type Decision } from "../api";
 import { Markdown } from "./Markdown";
-
-const TOOL_ACTION: Record<string, string> = {
-  Bash: "명령을 실행하려고 합니다",
-  Write: "파일을 만들려고 합니다",
-  Edit: "파일을 수정하려고 합니다",
-  MultiEdit: "파일을 수정하려고 합니다",
-  WebFetch: "웹 페이지를 읽으려고 합니다",
-  WebSearch: "웹을 검색하려고 합니다",
-};
 
 function useDecide(onError: (m: string) => void) {
   const [busy, setBusy] = useState(false);
@@ -26,23 +18,32 @@ function useDecide(onError: (m: string) => void) {
   return { busy, decide };
 }
 
-/** 권한 요청: 이번만 허용 / 이 세션 동안 허용 / 거부 (거부 사유는 에이전트에게 전달) */
+/** 권한 요청: 쉬운 말 설명 + 위험도, 원래 명령은 '자세히'(개발자 모드면 펼침). 이번만 / 이 대화 동안 / 거부 */
 export function PermissionCard({ ap, onError }: { ap: Approval; onError: (m: string) => void }) {
   const { busy, decide } = useDecide(onError);
+  const dev = useContext(DevModeContext);
   const [reason, setReason] = useState("");
   const [denying, setDenying] = useState(false);
-  const input = ap.toolInput as Record<string, unknown>;
+  const input = (ap.toolInput ?? {}) as Record<string, unknown>;
+  const plain = explain(ap.toolName, input);
   const detail =
     ap.toolName === "Bash"
-      ? String(input?.command ?? "")
-      : String(input?.file_path ?? input?.url ?? input?.query ?? JSON.stringify(input));
+      ? String(input.command ?? "")
+      : String(input.file_path ?? input.url ?? input.query ?? JSON.stringify(input));
   const sessionLabel = ap.toolName === "Bash" ? "이 명령은 이 대화 동안 허용" : "이 대화 동안 파일 수정 허용";
+  const risk = RISK_LABEL[plain.risk];
 
   return (
-    <div className="req-card perm">
-      <div className="req-title">{TOOL_ACTION[ap.toolName] ?? `${ap.toolName} 도구를 쓰려고 합니다`}</div>
-      {typeof input?.description === "string" && <div className="small muted">{input.description as string}</div>}
-      <pre className="mono req-detail">{detail}</pre>
+    <div className={`req-card perm risk-${plain.risk}`}>
+      <div className="row">
+        {risk && <span className={`badge ${plain.risk === "danger" ? "danger" : "warn"}`}>{risk}</span>}
+        <div className="req-title">{plain.title}</div>
+      </div>
+      {typeof input.description === "string" && <div className="small muted">{input.description}</div>}
+      <details open={dev}>
+        <summary className="small muted">자세히</summary>
+        <pre className="mono req-detail">{detail}</pre>
+      </details>
       {denying ? (
         <div className="row">
           <input

@@ -17,6 +17,8 @@ pub struct AppSettings {
     pub max_concurrency: u32,
     /// 창 닫기 시 트레이에 남아 작업을 계속할지 여부 (스펙 10장 기본 제안)
     pub close_to_tray: bool,
+    /// 개발자 모드: 원래 명령·세부 권한 등 개발자용 정보를 보여준다 (기본은 쉬운 말)
+    pub dev_mode: bool,
 }
 
 impl Default for AppSettings {
@@ -24,6 +26,7 @@ impl Default for AppSettings {
         Self {
             max_concurrency: 2,
             close_to_tray: true,
+            dev_mode: false,
         }
     }
 }
@@ -69,6 +72,43 @@ pub fn save(conn: &Connection, settings: &AppSettings) -> AppResult<()> {
     set_raw(conn, KEY_APP_SETTINGS, &serde_json::to_string(settings)?)
 }
 
+/// 사장(사용자) 캐릭터 (스펙 v0.2 4.7)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Boss {
+    pub name: String,
+    pub avatar: String,
+    pub color: String,
+}
+
+impl Default for Boss {
+    fn default() -> Self {
+        Self {
+            name: "사장".into(),
+            avatar: "a".into(),
+            color: "#c0392b".into(),
+        }
+    }
+}
+
+const KEY_BOSS: &str = "boss";
+
+pub fn load_boss(conn: &Connection) -> AppResult<Boss> {
+    Ok(get_raw(conn, KEY_BOSS)?
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default())
+}
+
+pub fn save_boss(conn: &Connection, boss: &Boss) -> AppResult<Boss> {
+    let mut b = boss.clone();
+    b.name = b.name.trim().to_string();
+    if b.name.is_empty() {
+        b.name = Boss::default().name;
+    }
+    set_raw(conn, KEY_BOSS, &serde_json::to_string(&b)?)?;
+    Ok(b)
+}
+
 pub fn current_project_id(conn: &Connection) -> AppResult<Option<i64>> {
     Ok(get_raw(conn, KEY_CURRENT_PROJECT)?.and_then(|v| v.parse().ok()))
 }
@@ -97,6 +137,7 @@ mod tests {
         let s = AppSettings {
             max_concurrency: 3,
             close_to_tray: false,
+            dev_mode: false,
         };
         save(&conn, &s).unwrap();
         assert_eq!(load(&conn).unwrap(), s);

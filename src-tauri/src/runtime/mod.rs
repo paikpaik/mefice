@@ -173,6 +173,20 @@ pub enum RunEvent {
         pre_tokens: Option<u64>,
         post_tokens: Option<u64>,
     },
+    /// 대화 응답에서 바뀐 파일 (되돌리기 가능)
+    Checkpoint {
+        checkpoint_id: i64,
+        /// 파일 이름 (최대 50개)
+        files: Vec<String>,
+        total: u32,
+    },
+    /// 되돌리기 결과
+    Restored {
+        checkpoint_id: i64,
+        restored: u32,
+        /// 응답 뒤 사용자가 고쳐서 건너뛴 파일
+        skipped: Vec<String>,
+    },
     /// 런타임 stderr (진단용, 일부만 저장)
     Stderr {
         text: String,
@@ -196,6 +210,8 @@ impl RunEvent {
             Self::PermissionDenied { .. } => "permission_denied",
             Self::TurnResult { .. } => "turn_result",
             Self::Compacted { .. } => "compacted",
+            Self::Checkpoint { .. } => "checkpoint",
+            Self::Restored { .. } => "restored",
             Self::Stderr { .. } => "stderr",
             Self::Notice { .. } => "notice",
         }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import {
   ALL_TOOLS,
   api,
@@ -11,6 +11,7 @@ import {
 } from "../api";
 import { AVATARS, AVATAR_LABEL, Character } from "../office/Character";
 import { COLORS, inputFromTemplate } from "../office/hire";
+import { ACCESS, accessOf, DevModeContext, type Access } from "../plain";
 
 const PERMISSION_LABEL: Record<PermissionMode, string> = {
   default: "수정·명령 실행 시 승인",
@@ -20,7 +21,7 @@ const PERMISSION_LABEL: Record<PermissionMode, string> = {
 
 type Editing =
   | { step: "template" }
-  | { step: "form"; id: number | null; isPm: boolean; input: AgentInput };
+  | { step: "form"; id: number | null; isPm: boolean; input: AgentInput; memory?: string };
 
 /** 고용·팀 관리 (스펙 4.3, 6장). 고용과 대기에는 토큰이 들지 않는다. */
 export function Team() {
@@ -45,7 +46,10 @@ export function Team() {
     setError(null);
     try {
       if (editing.id === null) await api.createAgent(editing.input);
-      else await api.updateAgent(editing.id, editing.input);
+      else {
+        await api.updateAgent(editing.id, editing.input);
+        if (editing.memory !== undefined) await api.setAgentMemory(editing.id, editing.memory);
+      }
       setEditing(null);
       load();
     } catch (e) {
@@ -68,6 +72,7 @@ export function Team() {
       step: "form",
       id: a.id,
       isPm: a.kind === "pm",
+      memory: a.kind === "worker" ? a.memory : undefined,
       input: {
         name: a.name,
         role: a.role,
@@ -94,8 +99,11 @@ export function Team() {
           고용과 대기에는 토큰이 들지 않습니다. 설정 변경은 실행 중인 작업에는 반영되지 않고 다음 실행부터 적용됩니다.
           역할 지침이 별도로 학습된 전문성을 보장하지는 않습니다.
         </p>
-        <div className="agent-grid">
-          {agents.map((a) => (
+        {groupByTeam(agents, catalog?.teams ?? []).map(([team, members]) => (
+          <div key={team} className="team-group">
+            <h3 className="team-title">{team}</h3>
+            <div className="agent-grid">
+              {members.map((a) => (
             <div key={a.id} className="agent-card">
               <svg viewBox="-24 -62 48 70" className="agent-avatar">
                 <Character color={a.color} avatar={a.profile.avatar} pose="stand" badge={a.kind === "pm" ? "PM" : null} />
@@ -116,7 +124,7 @@ export function Team() {
                   </div>
                 )}
                 <div className="small muted">
-                  {a.model ?? "기본 모델"} · {PERMISSION_LABEL[a.permissionMode]}
+                  {a.model ?? "기본 모델"} · {(() => { const k = accessOf(a); return k ? ACCESS[k].label : PERMISSION_LABEL[a.permissionMode]; })()}
                   {a.kind !== "pm" && a.profile.desk != null && ` · ${a.profile.desk + 1}번 자리`}
                 </div>
                 <div className="row">
@@ -127,6 +135,8 @@ export function Team() {
             </div>
           ))}
         </div>
+          </div>
+        ))}
         {error && <p className="error">{error}</p>}
       </section>
 
@@ -147,6 +157,8 @@ export function Team() {
           template={catalog.templates.find((t) => t.id === editing.input.profile.templateId) ?? null}
           takenDesks={agents.filter((a) => a.id !== editing.id && a.kind !== "pm").flatMap((a) => (a.profile.desk != null ? [a.profile.desk] : []))}
           onChange={(input) => setEditing({ ...editing, input })}
+          memory={editing.memory}
+          onMemory={(memory) => setEditing({ ...editing, memory })}
           onSave={save}
           onCancel={() => setEditing(null)}
           saveLabel={editing.id === null ? "고용 확정" : "저장"}
@@ -154,6 +166,19 @@ export function Team() {
       )}
     </div>
   );
+}
+
+/** 팀별로 묶는다: PM 먼저, 그다음 팀 목록 순서, 팀이 없으면 '기타' */
+function groupByTeam(agents: Agent[], teams: string[]): [string, Agent[]][] {
+  const groups = new Map<string, Agent[]>();
+  const pm = agents.filter((a) => a.kind === "pm");
+  if (pm.length) groups.set("PM", pm);
+  for (const t of teams) groups.set(`${t}팀`, []);
+  for (const a of agents.filter((a) => a.kind !== "pm")) {
+    const key = a.profile.team ? `${a.profile.team}팀` : "기타";
+    groups.set(key, [...(groups.get(key) ?? []), a]);
+  }
+  return [...groups.entries()].filter(([, v]) => v.length > 0);
 }
 
 function TemplatePicker({
@@ -177,6 +202,7 @@ function TemplatePicker({
             <svg viewBox="-24 -62 48 70" className="agent-avatar">
               <Character color={t.color} avatar={t.avatar} pose="stand" />
             </svg>
+            <span className="badge">{t.team}팀</span>
             <strong>{t.role}</strong>
             <span className="small muted">{t.summary}</span>
             <span className="small muted">{PERMISSION_LABEL[t.permissionMode]}</span>
@@ -207,6 +233,8 @@ function AgentForm({
   onSave,
   onCancel,
   saveLabel,
+  memory,
+  onMemory,
 }: {
   title: string;
   isPm: boolean;
@@ -218,9 +246,13 @@ function AgentForm({
   onSave: () => void;
   onCancel: () => void;
   saveLabel: string;
+  memory?: string;
+  onMemory: (m: string) => void;
 }) {
   const [specialty, setSpecialty] = useState("");
   const set = (patch: Partial<AgentInput>) => onChange({ ...input, ...patch });
+  const dev = useContext(DevModeContext);
+  const access = accessOf(input);
   const p = input.profile;
   const setP = (patch: Partial<AgentInput["profile"]>) => set({ profile: { ...p, ...patch } });
   const toggle = (list: string[], v: string) => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
@@ -274,6 +306,19 @@ function AgentForm({
               <span>역할</span>
               <input value={input.role} disabled={isPm} onChange={(e) => set({ role: e.target.value })} />
             </label>
+            {!isPm && (
+              <label className="field">
+                <span>팀</span>
+                <select value={p.team ?? ""} onChange={(e) => setP({ team: e.target.value || null })}>
+                  <option value="">기타</option>
+                  {catalog.teams.map((t) => (
+                    <option key={t} value={t}>
+                      {t}팀
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             {!isPm && (
               <label className="field">
                 <span>자리</span>
@@ -349,23 +394,44 @@ function AgentForm({
           )}
 
           <div className="field">
-            <span>도구 권한</span>
-            <div className="row wrap">
-              {ALL_TOOLS.map((t) => (
-                <label key={t} className="chip">
-                  <input type="checkbox" checked={input.tools.includes(t)} onChange={() => set({ tools: toggle(input.tools, t) })} />
-                  <span className="mono">{t}</span>
+            <span>할 수 있는 일</span>
+            <div className="access-options">
+              {(Object.keys(ACCESS) as Access[]).map((k) => (
+                <label key={k} className={`access-opt ${access === k ? "active" : ""}`}>
+                  <input
+                    type="radio"
+                    name="access"
+                    checked={access === k}
+                    onChange={() => set({ tools: [...ACCESS[k].tools], permissionMode: ACCESS[k].mode })}
+                  />
+                  <span>
+                    <strong>{ACCESS[k].label}</strong>
+                    <span className="small muted"> · {ACCESS[k].help}</span>
+                  </span>
                 </label>
               ))}
+              {access === null && <span className="small warn-text">세부 설정으로 바꾼 상태입니다</span>}
             </div>
-            <select value={input.permissionMode} onChange={(e) => set({ permissionMode: e.target.value as PermissionMode })}>
-              {(Object.keys(PERMISSION_LABEL) as PermissionMode[]).map((m) => (
-                <option key={m} value={m}>
-                  {PERMISSION_LABEL[m]}
-                </option>
-              ))}
-            </select>
-            <small className="muted">수정 작업은 격리된 작업 공간(git worktree)에서 실행되고, 결과는 직접 확인한 뒤 병합합니다.</small>
+            {dev && (
+              <details className="small">
+                <summary className="muted">세부 설정 (개발자 모드)</summary>
+                <div className="row wrap">
+                  {ALL_TOOLS.map((t) => (
+                    <label key={t} className="chip">
+                      <input type="checkbox" checked={input.tools.includes(t)} onChange={() => set({ tools: toggle(input.tools, t) })} />
+                      <span className="mono">{t}</span>
+                    </label>
+                  ))}
+                </div>
+                <select value={input.permissionMode} onChange={(e) => set({ permissionMode: e.target.value as PermissionMode })}>
+                  {(Object.keys(PERMISSION_LABEL) as PermissionMode[]).map((m) => (
+                    <option key={m} value={m}>
+                      {PERMISSION_LABEL[m]}
+                    </option>
+                  ))}
+                </select>
+              </details>
+            )}
           </div>
 
           <div className="form-grid">
@@ -425,6 +491,16 @@ function AgentForm({
               />
             </label>
           </div>
+
+          {memory !== undefined && (
+            <label className="field">
+              <span>업무 기억</span>
+              <small className="muted">
+                작업이 끝날 때 팀원이 남긴 "기억할 점"이 쌓입니다. 작업할 때마다 읽으므로, 틀린 내용은 고치거나 지워 주세요.
+              </small>
+              <textarea rows={4} value={memory} placeholder="아직 기억한 내용이 없습니다" onChange={(e) => onMemory(e.target.value)} />
+            </label>
+          )}
 
           <label className="field">
             <span>역할 지침</span>

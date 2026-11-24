@@ -6,6 +6,7 @@ import {
   type AppSettings,
   type EnvironmentReport,
   type ProjectView,
+  type SetupStatus,
 } from "../api";
 
 interface Props {
@@ -158,6 +159,10 @@ function ExecutionSection({ settings, onChange }: { settings: AppSettings; onCha
         />
         <span>창을 닫아도 트레이에 남아 작업 계속</span>
       </label>
+      <label className="field inline">
+        <input type="checkbox" checked={settings.devMode} onChange={(e) => update({ devMode: e.target.checked })} />
+        <span>개발자 모드 (승인 요청의 원래 명령, 팀원의 세부 권한 설정을 보여줍니다)</span>
+      </label>
       {error && <p className="error">{error}</p>}
     </section>
   );
@@ -165,11 +170,13 @@ function ExecutionSection({ settings, onChange }: { settings: AppSettings; onCha
 
 function EnvironmentSection() {
   const [report, setReport] = useState<EnvironmentReport | null>(null);
+  const [setup, setSetup] = useState<SetupStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function load() {
     setError(null);
     try {
+      api.getSetupStatus().then(setSetup).catch(() => {});
       setReport(await api.checkEnvironment());
     } catch (e) {
       setError(errorMessage(e));
@@ -194,6 +201,16 @@ function EnvironmentSection() {
           <p className="muted">
             {report.os} / {report.arch}
           </p>
+          {setup && (
+            <p>
+              Claude 계정:{" "}
+              {setup.loggedIn ? (
+                <span className="badge ok">로그인됨{setup.authMethod ? ` (${setup.authMethod})` : ""}</span>
+              ) : (
+                <span className="badge warn">로그인 필요 — 앱을 다시 열면 로그인 안내가 나옵니다</span>
+              )}
+            </p>
+          )}
           <table className="table">
             <thead>
               <tr>

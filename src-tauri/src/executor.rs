@@ -445,6 +445,15 @@ impl<R: Runtime> Executor<R> {
                 outcome.exit_code,
                 outcome.error.as_deref(),
             );
+            // 작업자 보고의 "기억할 점"을 업무 기억에 반영 (모델 호출 없음)
+            if outcome.status == RunStatus::Succeeded
+                && let Ok(run) = task::get_run(&conn, run_id)
+                && crate::agent::get(&conn, run.agent_id)
+                    .is_ok_and(|a| a.kind == crate::agent::KIND_WORKER)
+                && let Ok(Some(report)) = task::last_result_text(&conn, run_id)
+            {
+                let _ = crate::memory::absorb(&conn, run.agent_id, &report);
+            }
             // 런타임이 사용량을 한 번도 주지 않은 Run은 "미제공"으로 남긴다 (0으로 가정하지 않음)
             if let Ok(run) = task::get_run(&conn, run_id) {
                 let _ = usage::mark_unavailable_if_empty(&conn, run_id, &run.role);
@@ -473,6 +482,114 @@ impl<R: Runtime> Executor<R> {
         self.notify_run(run_id);
         self.after_run_finished(run_id).await;
         self.pump();
+    }
+
+    fn shadow(&self, project_id: i64, cwd: &str) -> crate::checkpoint::Shadow {
+        let root = self
+            .worktree_root
+            .parent()
+            .map(|p| p.join("shadow"))
+            .unwrap_or_else(|| self.worktree_root.join("shadow"));
+        crate::checkpoint::Shadow::new(&root, project_id, std::path::Path::new(cwd))
+    }
+
+    /// 대화 응답 전 상태 기록 (실패해도 대화는 계속)
+    async fn checkpoint_before(&self, run_id: i64, project_id: i64, cwd: &str) -> Option<String> {
+        let shadow = self.shadow(project_id, cwd);
+        let r = tauri::async_runtime::spawn_blocking(move || shadow.snapshot("응답 전")).await;
+        match r {
+            Ok(Ok(c)) => Some(c),
+            Ok(Err(e)) => {
+                self.record(
+                    run_id,
+                    RunEvent::Notice {
+                        text: format!("되돌리기 기록을 남기지 못했습니다: {e}"),
+                    },
+                );
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// 대화 응답 후 상태 기록 → 바뀐 파일이 있으면 되돌리기 항목을 남긴다
+    async fn checkpoint_after(&self, run: &task::Run, project_id: i64, before: String) {
+        let shadow = self.shadow(project_id, &run.cwd);
+        let b = before.clone();
+        let r =
+            tauri::async_runtime::spawn_blocking(move || -> AppResult<(String, Vec<String>)> {
+                let after = shadow.snapshot("응답 후")?;
+                let files = shadow.changed(&b, &after)?;
+                Ok((after, files))
+            })
+            .await;
+        let Ok(Ok((after, files))) = r else { return };
+        if files.is_empty() {
+            return;
+        }
+        let id = self.db().conn().and_then(|c| {
+            crate::checkpoint::insert(&c, run.task_id, run.id, project_id, &before, &after, &files)
+        });
+        if let Ok(id) = id {
+            self.record(
+                run.id,
+                RunEvent::Checkpoint {
+                    checkpoint_id: id,
+                    files: crate::checkpoint::listed(&files),
+                    total: files.len() as u32,
+                },
+            );
+        }
+    }
+
+    /// 대화 응답을 응답 전 상태로 되돌린다 (사용자가 버튼을 누를 때만)
+    pub async fn restore_checkpoint(
+        &self,
+        checkpoint_id: i64,
+    ) -> AppResult<crate::checkpoint::RestoreResult> {
+        let cp = {
+            let c = self.db().conn()?;
+            let cp = crate::checkpoint::get(&c, checkpoint_id)?;
+            if cp.restored_at.is_some() {
+                return Err(AppError::InvalidInput("이미 되돌린 응답입니다".into()));
+            }
+            let busy = task::latest_run(&c, cp.task_id)?.is_some_and(|r| {
+                matches!(
+                    r.status,
+                    RunStatus::Queued
+                        | RunStatus::Running
+                        | RunStatus::WaitingForApproval
+                        | RunStatus::Cancelling
+                )
+            });
+            if busy {
+                return Err(AppError::InvalidInput(
+                    "응답이 끝난 뒤에 되돌릴 수 있습니다".into(),
+                ));
+            }
+            cp
+        };
+        let run = self
+            .db()
+            .conn()
+            .and_then(|c| task::get_run(&c, cp.run_id))?;
+        let shadow = self.shadow(cp.project_id, &run.cwd);
+        let (b, a) = (cp.before_commit.clone(), cp.after_commit.clone());
+        let result = tauri::async_runtime::spawn_blocking(move || shadow.restore(&b, &a))
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))??;
+        self.db()
+            .conn()
+            .and_then(|c| crate::checkpoint::mark_restored(&c, checkpoint_id))?;
+        self.record(
+            cp.run_id,
+            RunEvent::Restored {
+                checkpoint_id,
+                restored: result.restored.len() as u32,
+                skipped: result.skipped.clone(),
+            },
+        );
+        Ok(result)
     }
 
     fn emit_activity(&self, task_id: i64, run_id: i64, activity: &str) {
@@ -638,6 +755,21 @@ impl<R: Runtime> Executor<R> {
             .conn()
             .and_then(|c| task::take_run_attachments(&c, run_id))
             .unwrap_or_default();
+        // 대화: 응답 전 폴더 상태 기록 (되돌리기용)
+        let chat_project = self
+            .db()
+            .conn()
+            .and_then(|c| task::get_task(&c, run.task_id))
+            .ok()
+            .filter(|t| t.mode == crate::chat::MODE_CHAT)
+            .map(|t| t.project_id);
+        let mut turn_before = match chat_project {
+            Some(pid) => {
+                self.checkpoint_before(run_id, pid, &cwd.to_string_lossy())
+                    .await
+            }
+            None => None,
+        };
         self.record(
             run_id,
             RunEvent::UserMessage {
@@ -696,6 +828,13 @@ impl<R: Runtime> Executor<R> {
                                             Err(e) => eprintln!("[executor] 사용량 기록 실패 run={run_id}: {e}"),
                                         }
                                         pending_turns = pending_turns.saturating_sub(1);
+                                        if pending_turns == 0
+                                            && let (Some(pid), Some(before)) = (chat_project, turn_before.take())
+                                        {
+                                            let mut r = run.clone();
+                                            r.cwd = cwd.to_string_lossy().to_string();
+                                            self.checkpoint_after(&r, pid, before).await;
+                                        }
                                         let err_text = is_error.then(|| {
                                             claude_code::describe_error(subtype, &config.limits)
                                                 .or_else(|| result.clone())
@@ -783,15 +922,23 @@ impl<R: Runtime> Executor<R> {
                         Some(Control::UserMessage(text, images, reply)) => {
                             if cancel_requested || stdin.is_none() {
                                 let _ = reply.send(Err(AppError::InvalidInput("실행이 끝나는 중입니다. '이어서 실행'으로 지시하세요".into())));
-                            } else if write_line(&mut stdin, &claude_code::encode_user_content(&text, &images)).await {
-                                pending_turns += 1;
-                                self.record(run_id, RunEvent::UserMessage { text, images: images.len() as u32 });
-                                if idle_deadline.take().is_some() {
-                                    self.set_status(run_id, RunStatus::Running);
-                                }
-                                let _ = reply.send(Ok(()));
                             } else {
-                                let _ = reply.send(Err(AppError::Internal("런타임에 메시지를 전달하지 못했습니다".into())));
+                                // 쉬던 대화에 새 메시지 → 새 응답의 "전" 상태 기록 (되돌리기용)
+                                if pending_turns == 0 && turn_before.is_none()
+                                    && let Some(pid) = chat_project
+                                {
+                                    turn_before = self.checkpoint_before(run_id, pid, &cwd.to_string_lossy()).await;
+                                }
+                                if write_line(&mut stdin, &claude_code::encode_user_content(&text, &images)).await {
+                                    pending_turns += 1;
+                                    self.record(run_id, RunEvent::UserMessage { text, images: images.len() as u32 });
+                                    if idle_deadline.take().is_some() {
+                                        self.set_status(run_id, RunStatus::Running);
+                                    }
+                                    let _ = reply.send(Ok(()));
+                                } else {
+                                    let _ = reply.send(Err(AppError::Internal("런타임에 메시지를 전달하지 못했습니다".into())));
+                                }
                             }
                         }
                         Some(Control::Permission(line)) => {
@@ -2087,6 +2234,126 @@ mod live_tests {
 
             env.exec.cancel(r1).unwrap();
             wait_until(&env, r1, 30, |r| r.status.is_terminal()).await;
+        });
+    }
+
+    /// A단계 3번: 대화 응답에서 명령으로 지운 파일·덮어쓴 파일을 되돌린다 (에이전트가 되살리기 어려운 경우)
+    #[test]
+    #[ignore]
+    fn live_대화_되돌리기() {
+        use crate::chat::{self, ChatOptions};
+        let (env, _agent) = setup(PermissionMode::Default);
+        let w = env.proj.path().to_path_buf();
+        std::fs::write(w.join("old.md"), "지우면 안 되는 원본\n").unwrap();
+        std::fs::write(w.join("report.md"), "보고서 원본\n").unwrap();
+        let conn_of = || env.handle.state::<Db>().inner().conn().unwrap();
+        tauri::async_runtime::block_on(async {
+            let opts = ChatOptions {
+                model: Some("haiku".into()),
+                permission_mode: PermissionMode::AcceptEdits,
+                ..Default::default()
+            };
+            let r1 = {
+                let c = conn_of();
+                let pid = settings::current_project_id(&c).unwrap().unwrap();
+                let p = project::get(&c, pid).unwrap().unwrap();
+                chat::start(&c, &p, "Bash로 'rm old.md'를 실행하고, Write 도구로 report.md 내용을 '덮어씀' 한 줄로 바꿔. 다른 일은 하지 마.", &opts, &[]).unwrap().1.id
+            };
+            env.exec.pump();
+            // rm은 승인이 필요하다 → 허용
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let r = run(&env, r1);
+                if r.status == RunStatus::WaitingForInput {
+                    break;
+                }
+                for ap in task::pending_approvals(&conn_of(), r1).unwrap() {
+                    env.exec.decide(ap.id, Decision::Allow, None, None).unwrap();
+                }
+                assert!(Instant::now() < deadline, "시간 초과: {:?}", r.status);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            assert!(!w.join("old.md").exists(), "에이전트가 지움");
+            assert_eq!(
+                std::fs::read_to_string(w.join("report.md")).unwrap().trim(),
+                "덮어씀"
+            );
+
+            let cp = task::list_events(&conn_of(), r1)
+                .unwrap()
+                .into_iter()
+                .find_map(|e| match e.event {
+                    RunEvent::Checkpoint {
+                        checkpoint_id,
+                        files,
+                        total,
+                    } => Some((checkpoint_id, files, total)),
+                    _ => None,
+                });
+            println!("되돌리기 기록: {cp:?}");
+            let (id, files, _) = cp.expect("바뀐 파일이 있으면 되돌리기 기록이 남아야 함");
+            assert!(
+                files.contains(&"old.md".to_string()) && files.contains(&"report.md".to_string())
+            );
+
+            let res = env.exec.restore_checkpoint(id).await.unwrap();
+            println!("되돌림: {res:?}");
+            assert_eq!(
+                std::fs::read_to_string(w.join("old.md")).unwrap(),
+                "지우면 안 되는 원본\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(w.join("report.md")).unwrap(),
+                "보고서 원본\n"
+            );
+            assert!(
+                env.exec.restore_checkpoint(id).await.is_err(),
+                "두 번 되돌리지 않음"
+            );
+            assert!(!w.join(".git").exists());
+
+            env.exec.cancel(r1).unwrap();
+            wait_until(&env, r1, 30, |r| r.status.is_terminal()).await;
+        });
+    }
+
+    /// A단계 5번: 작업 보고의 "기억할 점"이 업무 기억에 쌓이고, 다음 작업에 전달된다 (모델 추가 호출 없음)
+    #[test]
+    #[ignore]
+    fn live_팀원_기억() {
+        let (env, agent_id) = setup(PermissionMode::AcceptEdits);
+        let conn_of = || env.handle.state::<Db>().inner().conn().unwrap();
+        tauri::async_runtime::block_on(async {
+            let r1 = start(
+                &env,
+                agent_id,
+                "a.txt를 만들고 내용은 a 로 해. 그리고 사장인 내가 앞으로 파일 내용은 항상 대문자로 쓰길 원한다는 점을 기억해 둬.",
+            );
+            let d1 = wait_until(&env, r1, 120, |r| r.status.is_terminal()).await;
+            assert_eq!(d1.status, RunStatus::Succeeded, "{:?}", d1.error);
+            let mem = crate::memory::get(&conn_of(), agent_id).unwrap();
+            println!("업무 기억: {mem}");
+            assert!(
+                !mem.trim().is_empty(),
+                "보고의 기억할 점이 노트에 들어가야 함"
+            );
+
+            // 다음 작업의 설정 스냅샷에 기억이 들어간다
+            // 내용을 직접 지정하지 않아야 기억한 선호가 적용된다 (지정하면 지정이 우선이라고 팀원이 기록함)
+            let r2 = start(&env, agent_id, "b.txt를 만들고 영어 인사말 한 단어를 써.");
+            let d2 = wait_until(&env, r2, 120, |r| r.status.is_terminal()).await;
+            assert!(d2.config.system_append.contains("내 업무 기억"));
+            let b = std::fs::read_to_string(env.proj.path().join("b.txt")).unwrap_or_default();
+            println!("두 번째 작업 결과 b.txt: {b:?}");
+            let word = b.trim();
+            assert!(
+                !word.is_empty()
+                    && word
+                        .chars()
+                        .filter(|c| c.is_alphabetic())
+                        .all(|c| c.is_uppercase()),
+                "기억한 선호(대문자)를 따름: {word}"
+            );
         });
     }
 }

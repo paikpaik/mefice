@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
-import { api, errorMessage, type AppSettings, type ProjectView } from "./api";
+import { api, errorMessage, type AppSettings, type ProjectView, type SetupStatus } from "./api";
 import { Welcome } from "./screens/Welcome";
+import { Setup } from "./screens/Setup";
 import { Settings } from "./screens/Settings";
 import { Office } from "./office/Office";
 import { ChatScreen } from "./chat/ChatScreen";
 import { QuitDialog } from "./components/QuitDialog";
+import { DevModeContext } from "./plain";
 import { Tasks } from "./screens/Tasks";
 import { PmChat } from "./screens/PmChat";
 import { Team } from "./screens/Team";
@@ -29,15 +31,30 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [project, setProject] = useState<ProjectView | null>(null);
   const [tab, setTab] = useState<Tab>("chat");
+  // 처음 실행 안내: 설치·로그인이 안 됐을 때만 보여 준다
+  const [setup, setSetup] = useState<SetupStatus | null>(null);
+  const [showSetup, setShowSetup] = useState(false);
   // PM 채팅 등에서 특정 작업으로 이동할 때 사용
   const [focusTask, setFocusTask] = useState<{ id: number; nonce: number } | null>(null);
+  const [focusChat, setFocusChat] = useState<{ id: number; nonce: number } | null>(null);
   const openTask = (id: number) => {
     setFocusTask({ id, nonce: Date.now() });
     setTab("board");
   };
+  const openChat = (id: number) => {
+    setFocusChat({ id, nonce: Date.now() });
+    setTab("chat");
+  };
 
   // 앱 시작 시 저장된 설정과 마지막 프로젝트 복원 (1단계 완료 기준)
   useEffect(() => {
+    api
+      .getSetupStatus()
+      .then((st) => {
+        setSetup(st);
+        setShowSetup(!st.installed || st.loggedIn === false);
+      })
+      .catch(() => {});
     api
       .getAppState()
       .then((s) => {
@@ -50,9 +67,11 @@ export default function App() {
 
   if (loading) return <div className="center muted">불러오는 중…</div>;
   if (loadError || !settings) return <div className="center error">앱 상태를 불러오지 못했습니다: {loadError}</div>;
+  if (showSetup && setup) return <Setup status={setup} onStatus={setSetup} onSkip={() => setShowSetup(false)} />;
   if (!project) return <Welcome onOpened={setProject} />;
 
   return (
+    <DevModeContext.Provider value={settings.devMode}>
     <div className="shell">
       <QuitDialog />
       <nav className="sidebar">
@@ -70,8 +89,8 @@ export default function App() {
         ))}
       </nav>
       <main className="content">
-        {tab === "chat" && <ChatScreen />}
-        {tab === "office" && <Office onOpenTask={openTask} onGoTeam={() => setTab("team")} />}
+        {tab === "chat" && <ChatScreen key={focusChat?.nonce} initialChatId={focusChat?.id ?? null} />}
+        {tab === "office" && <Office onOpenTask={openTask} onOpenChat={openChat} onGoTeam={() => setTab("team")} />}
         {tab === "pm" && <PmChat onOpenTask={openTask} onGoTeam={() => setTab("team")} />}
         {tab === "board" && (
           <Tasks
@@ -93,5 +112,6 @@ export default function App() {
         )}
       </main>
     </div>
+    </DevModeContext.Provider>
   );
 }

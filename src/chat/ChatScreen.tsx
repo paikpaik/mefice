@@ -30,9 +30,9 @@ function activityLabel(a: string | null): string | null {
 }
 
 /** 대화 화면 (v0.2 A단계 1번): 공식 Claude Code 대화 UI와 같은 기능을 Mefice 디자인으로 */
-export function ChatScreen() {
+export function ChatScreen({ initialChatId = null }: { initialChatId?: number | null }) {
   const [chats, setChats] = useState<ChatSummary[]>([]);
-  const [selected, setSelected] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number | null>(initialChatId);
   const [error, setError] = useState<string | null>(null);
 
   const loadChats = useCallback(() => api.listChats().then(setChats).catch((e) => setError(errorMessage(e))), []);
@@ -242,7 +242,11 @@ function ChatView({ chatId, onNewChat }: { chatId: number; onNewChat: () => void
 /** 이벤트를 대화 형태로: 사용자 말풍선, 에이전트 마크다운, 도구 카드(결과를 짝지어) */
 function MessageList({ events }: { events: StoredEvent[] }) {
   const results = new Map<string, Extract<StoredEvent, { kind: "tool_result" }>>();
-  for (const e of events) if (e.kind === "tool_result") results.set(e.toolUseId, e);
+  const restored = new Set<number>();
+  for (const e of events) {
+    if (e.kind === "tool_result") results.set(e.toolUseId, e);
+    if (e.kind === "restored") restored.add(e.checkpointId);
+  }
 
   return (
     <>
@@ -272,6 +276,17 @@ function MessageList({ events }: { events: StoredEvent[] }) {
             return (
               <div key={key} className="msg-system">
                 허용되지 않은 도구: {e.toolName}
+              </div>
+            );
+          case "checkpoint":
+            return <CheckpointLine key={key} e={e} done={restored.has(e.checkpointId)} />;
+          case "restored":
+            return (
+              <div key={key} className="msg-system">
+                파일 {e.restored}개를 응답 전으로 되돌렸습니다
+                {e.skipped.length > 0 && (
+                  <span className="warn-text"> · 그 뒤 직접 고친 파일 {e.skipped.length}개는 그대로 두었습니다 ({e.skipped.join(", ")})</span>
+                )}
               </div>
             );
           case "compacted":
@@ -318,6 +333,37 @@ function TodoPanel({ todos }: { todos: Todo[] }) {
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+/** 응답에서 바뀐 파일 · 되돌리기 (응답 전 상태로) */
+function CheckpointLine({ e, done }: { e: Extract<StoredEvent, { kind: "checkpoint" }>; done: boolean }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const more = e.total - e.files.length;
+  const restore = async () => {
+    const list = e.files.join("\n") + (more > 0 ? `\n외 ${more}개` : "");
+    if (!confirm(`이 응답에서 바뀐 파일을 응답 전으로 되돌릴까요?\n\n${list}`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.restoreCheckpoint(e.checkpointId);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="checkpoint-line small" title={e.files.join("\n")}>
+      <span className="muted">파일 {e.total}개 바뀜</span>
+      {!done && (
+        <button className="link" disabled={busy} onClick={restore}>
+          되돌리기
+        </button>
+      )}
+      {error && <span className="error">{error}</span>}
     </div>
   );
 }

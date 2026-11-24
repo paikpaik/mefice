@@ -35,14 +35,19 @@ export function inputFromTemplate(t: AgentTemplate | null, agents: Agent[]): Age
     permissionMode: t.permissionMode,
     tools: [...t.tools],
     color: t.color,
-    profile: { ...profile, templateId: t.id, avatar: t.avatar, capabilities: [...t.capabilities] },
+    profile: { ...profile, templateId: t.id, team: t.team, avatar: t.avatar, capabilities: [...t.capabilities] },
   };
 }
 
 /** PM이 제안한 역할 이름에 가장 가까운 템플릿 */
 export function templateForRole(role: string, templates: AgentTemplate[]): AgentTemplate | null {
   const r = role.toLowerCase();
+  // 구체적인 분야를 먼저 본다 (예: "UI 디자인"은 프론트엔드보다 디자인, "법률 검토"는 리뷰어보다 법률)
   const keys: Record<string, string[]> = {
+    legal: ["법률", "법무", "계약", "legal", "약관"],
+    designer: ["디자인", "design", "시안"],
+    automation: ["자동화", "automation", "스크립트", "엑셀", "csv"],
+    writer: ["문서", "작성", "보고서", "writer", "회의록", "기획"],
     backend: ["백엔드", "backend", "서버", "api", "db", "데이터베이스"],
     frontend: ["프론트", "frontend", "ui", "화면", "react", "웹"],
     qa: ["qa", "테스트", "test", "품질"],
